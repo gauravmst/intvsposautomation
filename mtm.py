@@ -40,7 +40,7 @@ def dte_numbers(value) -> list[int]:
         return []
     return [int(n) for n in DTE_NUM_RE.findall(str(value))]
 
-
+#special jo acc 0 se start hote h 
 def normalize_target_user_id(value):
     """Collapse known leading-zero variants of a user_id onto one canonical form."""
     normalized = str(value).strip()
@@ -249,7 +249,7 @@ def build_excel(rollup: pd.DataFrame, raw: pd.DataFrame) -> bytes:
     alloc_rng = f"Data!$E$2:$E${data_last}"
     mtm_rng = f"Data!$F$2:$F${data_last}"
 
-    headers = ["Alias", "UserID", "AUM", "Total MTM", "MTM%",
+    headers = ["Alias", "UserID", "AUM", "Total MTM", "MTM%", "Avg MTM%", "Below Avg",
                "Trading Days", "Broker", "Server"]
     summary_rows = []
 
@@ -259,6 +259,11 @@ def build_excel(rollup: pd.DataFrame, raw: pd.DataFrame) -> bytes:
             ws = wb.create_sheet(sheet)
             ws.append(headers)
             algo_lit = _algo_criteria(algo)
+            last_data = 1 + len(g)  # last data row index (row 1 is header)
+            # AUM-weighted MTM% for the block = SUM(Total MTM) / SUM(AUM) * 100,
+            # i.e. the same figure as the TOTAL row's MTM%.
+            wavg_formula = (f'=IFERROR(SUM($D$2:$D${last_data})/'
+                            f'SUM($C$2:$C${last_data})*100,"")')
 
             r = 2
             for _, rec in g.iterrows():
@@ -269,9 +274,11 @@ def build_excel(rollup: pd.DataFrame, raw: pd.DataFrame) -> bytes:
                 ws.cell(r, 4, (f"=SUMIFS({mtm_rng},{algo_rng},{algo_lit},"
                                f"{uid_rng},$B{r})"))
                 ws.cell(r, 5, f'=IF(C{r}=0,"",D{r}/C{r}*100)')
-                ws.cell(r, 6, _cell_val(rec.get("Trading Days")))
-                ws.cell(r, 7, _cell_val(rec.get("Broker")))
-                ws.cell(r, 8, _cell_val(rec.get("Server")))
+                ws.cell(r, 6, wavg_formula)
+                ws.cell(r, 7, f'=IF(AND(ISNUMBER(E{r}),ISNUMBER(F{r}),E{r}<F{r}),TRUE,FALSE)')
+                ws.cell(r, 8, _cell_val(rec.get("Trading Days")))
+                ws.cell(r, 9, _cell_val(rec.get("Broker")))
+                ws.cell(r, 10, _cell_val(rec.get("Server")))
                 r += 1
 
             tr = r
@@ -279,17 +286,20 @@ def build_excel(rollup: pd.DataFrame, raw: pd.DataFrame) -> bytes:
             ws.cell(tr, 3, f"=SUM(C2:C{tr - 1})")
             ws.cell(tr, 4, f"=SUM(D2:D{tr - 1})")
             ws.cell(tr, 5, f'=IF(C{tr}=0,"",D{tr}/C{tr}*100)')
+            ws.cell(tr, 6, wavg_formula)
 
             for rr in range(2, tr + 1):
                 ws.cell(rr, 3).number_format = MONEY_FMT
                 ws.cell(rr, 4).number_format = MONEY_FMT
                 ws.cell(rr, 5).number_format = PCT_FMT
-            for c in range(1, 9):
+                ws.cell(rr, 6).number_format = PCT_FMT
+                ws.cell(rr, 7).alignment = CENTER
+            for c in range(1, 11):
                 ws.cell(tr, c).font = TOTAL_FONT
                 ws.cell(tr, c).border = TOTAL_TOP
-            _style_header(ws, 8)
-            _add_sign_colors(ws, [f"D2:D{tr}", f"E2:E{tr}"])
-            for col, w in zip("ABCDEFGH", (20, 16, 14, 14, 11, 13, 16, 14)):
+            _style_header(ws, 10)
+            _add_sign_colors(ws, [f"D2:D{tr}", f"E2:E{tr}", f"F2:F{tr}"])
+            for col, w in zip("ABCDEFGHIJ", (20, 16, 14, 14, 11, 11, 11, 13, 16, 14)):
                 ws.column_dimensions[col].width = w
 
             summary_rows.append((algo, acct_type, len(g), sheet, tr))
@@ -675,6 +685,28 @@ PAGE = """
                     padding:6px 14px; border-radius:20px; border:1px solid var(--line2);
                     transition:background-color .3s, color .3s; }
 
+    /* ---------- Report tabs ---------- */
+    .tabbar { display:flex; flex-wrap:wrap; gap:8px; margin:4px 0 20px;
+              padding:6px; background:var(--card); border:1px solid var(--line);
+              border-radius:14px; box-shadow:var(--card-shadow); }
+    .tab { background:transparent; color:var(--muted); border:1px solid transparent;
+           border-radius:10px; padding:10px 16px; font-weight:700; font-size:13.5px;
+           cursor:pointer; display:inline-flex; align-items:center; gap:8px;
+           box-shadow:none; transition:background-color .18s, color .18s, transform .12s; }
+    .tab:hover { background:var(--hover-tint); color:var(--ink); transform:none; }
+    .tab.active { background:linear-gradient(135deg,var(--accent),var(--accent2));
+                  color:#051426; box-shadow:0 8px 20px -10px rgba(56,189,248,.7); }
+    .tab .tab-ico { font-size:15px; }
+    .tabcount { font-size:11px; font-weight:800; padding:2px 8px; border-radius:99px;
+                background:var(--card2); color:var(--muted); }
+    .tab.active .tabcount { background:rgba(5,20,38,.18); color:#051426; }
+    .report-panel { animation:fadeUp .35s ease both; }
+
+    /* ---------- Below-average flag ---------- */
+    .flag-yes { color:var(--red); font-weight:800; font-size:11px; letter-spacing:.4px; }
+    .flag-no  { color:var(--muted); font-weight:700; font-size:11px; letter-spacing:.4px; }
+    .avgcol { color:var(--accent2); font-weight:700; }
+
     /* ---------- Allocation report ---------- */
     .alloc-report .section-title { margin:0 0 14px; }
     .alloc-note { color:var(--muted); font-weight:600; text-transform:none;
@@ -813,29 +845,46 @@ PAGE = """
 
     {% if error %}<div class="card err">⚠️ {{ error }}</div>{% endif %}
 
-    {% if summary_html %}
-      <div class="card">
-        <div class="bar">
-          <h2>Summary <span class="range">— {{ range_label }}</span></h2>
-          <a class="dl" href="/download/{{ token }}">⬇️ Download Excel (all sheets)</a>
+    {% if reports %}
+      <div class="tabbar" role="tablist">
+        {% for rep in reports %}
+          <button type="button" class="tab {% if loop.first %}active{% endif %}"
+                  data-target="panel-{{ rep.key }}" onclick="showTab(this)">
+            <span class="tab-ico">{{ rep.icon }}</span>{{ rep.label }}
+            <span class="tabcount">{{ rep.count }}</span>
+          </button>
+        {% endfor %}
+      </div>
+
+      {% for rep in reports %}
+      <div class="report-panel" id="panel-{{ rep.key }}" {% if not loop.first %}style="display:none"{% endif %}>
+        <div class="card">
+          <div class="bar">
+            <h2>{{ rep.label }} <span class="range">— {{ range_label }} · {{ rep.count }} accounts</span></h2>
+            <a class="dl" href="/download/{{ rep.token }}">⬇️ Download Excel (all sheets)</a>
+          </div>
+          {% if rep.summary_html %}{{ rep.summary_html|safe }}
+          {% else %}<p class="alloc-empty">No accounts in this view.</p>{% endif %}
         </div>
-        {{ summary_html|safe }}
-      </div>
 
-      {% if alloc_report_html %}
-      <div class="card">
-        {{ alloc_report_html|safe }}
-      </div>
-      {% endif %}
+        {% if rep.alloc_report_html %}
+        <div class="card">
+          {{ rep.alloc_report_html|safe }}
+        </div>
+        {% endif %}
 
-      <p class="section-title">Per algo / type</p>
-      {% for blk in blocks %}
-        <details>
-          <summary>Algo {{ blk.algo }}
-            <span class="badge {{ 'int' if blk.type=='INT' else 'pos' }}">{{ blk.type }}</span>
-            <span class="count">{{ blk.count }} accounts</span></summary>
-          <div class="scroll">{{ blk.html|safe }}</div>
-        </details>
+        {% if rep.blocks %}
+        <p class="section-title">Per algo / type</p>
+        {% for blk in rep.blocks %}
+          <details>
+            <summary>Algo {{ blk.algo }}
+              <span class="badge {{ 'int' if blk.type=='INT' else 'pos' }}">{{ blk.type }}</span>
+              <span class="count">{{ blk.count }} accounts · avg {{ blk.avg }}</span></summary>
+            <div class="scroll">{{ blk.html|safe }}</div>
+          </details>
+        {% endfor %}
+        {% endif %}
+      </div>
       {% endfor %}
     {% endif %}
   </div>
@@ -854,6 +903,15 @@ PAGE = """
       document.documentElement.setAttribute('data-theme', next);
       try { localStorage.setItem('theme', next); } catch (e) {}
       applyThemeUI(next);
+    }
+
+    function showTab(btn) {
+      const target = btn.getAttribute('data-target');
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      btn.classList.add('active');
+      document.querySelectorAll('.report-panel').forEach(p => {
+        p.style.display = (p.id === target) ? '' : 'none';
+      });
     }
 
     function filterList(input, listId) {
@@ -918,7 +976,23 @@ def _fmt_pct(x):
         return x
 
 
-def _table_html(df: pd.DataFrame, money_cols, pct_cols, total_label_col=None) -> str:
+def _fmt_avg_pct(x):
+    """Average-MTM% column: coloured accent value."""
+    try:
+        return f'<span class="avgcol">{x:.2f}%</span>'
+    except (ValueError, TypeError):
+        return x
+
+
+def _fmt_below_flag(x):
+    """Render the Below-Avg boolean as a coloured TRUE/FALSE flag."""
+    if x is True or (isinstance(x, str) and x.lower() == "true"):
+        return '<span class="flag-yes">TRUE</span>'
+    return '<span class="flag-no">FALSE</span>'
+
+
+def _table_html(df: pd.DataFrame, money_cols, pct_cols, total_label_col=None,
+                avg_cols=(), flag_cols=()) -> str:
     d = df.copy()
     for c in money_cols:
         if c in d.columns:
@@ -926,6 +1000,12 @@ def _table_html(df: pd.DataFrame, money_cols, pct_cols, total_label_col=None) ->
     for c in pct_cols:
         if c in d.columns:
             d[c] = d[c].map(_fmt_pct)
+    for c in avg_cols:
+        if c in d.columns:
+            d[c] = d[c].map(_fmt_avg_pct)
+    for c in flag_cols:
+        if c in d.columns:
+            d[c] = d[c].map(_fmt_below_flag)
     html = d.to_html(index=False, escape=False, border=0)
     if total_label_col:
         html = html.replace("<tr>\n      <td>TOTAL", '<tr class="total">\n      <td>TOTAL')
@@ -1232,6 +1312,74 @@ def write_alloc_sheet(ws, rep):
         ws.column_dimensions[get_column_letter(c)].width = 11
 
 
+# ---------------------------------------------------------------------------
+# Scoped reports (Overall / 1CR+ / Below 1CR) + per-account detail blocks
+# ---------------------------------------------------------------------------
+
+THRESH_1CR = 10_000_000  # AUM = allocation * 100, so 1CR = 10,000,000
+
+# Columns shown in each per-algo/type detail table, including the two new
+# analysis columns: the peer-group average MTM% and the below-average flag.
+DETAIL_COLS = ["Alias", "UserID", "AUM", "Total MTM", "MTM%", "Avg MTM%", "Below Avg",
+               "Trading Days", "Broker", "Server"]
+
+
+def _scope_rollups(rollup: pd.DataFrame):
+    """Yield (key, label, icon, scoped_rollup) for the three report views."""
+    if rollup is None or rollup.empty:
+        empty = rollup if rollup is not None else pd.DataFrame()
+        return [
+            ("overall", "Overall", "🌐", empty),
+            ("ge1cr", "1CR & above", "💎", empty),
+            ("lt1cr", "Below 1CR", "🔹", empty),
+        ]
+    aum = rollup["AUM"]
+    return [
+        ("overall", "Overall", "🌐", rollup),
+        ("ge1cr", "1CR & above", "💎", rollup[aum >= THRESH_1CR]),
+        ("lt1cr", "Below 1CR", "🔹", rollup[aum < THRESH_1CR]),
+    ]
+
+
+def _scope_raw(df_range: pd.DataFrame, scoped_rollup: pd.DataFrame) -> pd.DataFrame:
+    """Slice raw rows down to the accounts present in a scoped rollup."""
+    if scoped_rollup is None or scoped_rollup.empty:
+        return df_range.iloc[0:0]
+    ids = set(zip(scoped_rollup["Algo"].tolist(), scoped_rollup["UserID"].tolist()))
+    pairs = zip(df_range["algo"].tolist(), df_range["user_id"].tolist())
+    mask = [p in ids for p in pairs]
+    return df_range.loc[mask]
+
+
+def build_detail_blocks(rollup: pd.DataFrame) -> list:
+    """Per-algo/type detail tables with aggregate MTM% + below-average flag.
+
+    'Avg MTM%' is the AUM-weighted MTM% of that same algo/type block
+    (total MTM / total AUM * 100, i.e. the block's TOTAL-row MTM%), repeated on
+    every row; 'Below Avg' is TRUE when the row's MTM% is below that value.
+    """
+    blocks = []
+    if rollup is None or rollup.empty:
+        return blocks
+    for (algo, acct_type), g in rollup.groupby(["Algo", "Type"], sort=True):
+        g = g.copy()
+        tot_aum = g["AUM"].sum()
+        tot_mtm = g["Total MTM"].sum()
+        avg = (tot_mtm / tot_aum * 100) if tot_aum else float("nan")
+        g["Avg MTM%"] = avg
+        g["Below Avg"] = g["MTM%"] < avg  # NaN compares False
+        cols = [c for c in DETAIL_COLS if c in g.columns]
+        html = _table_html(
+            g[cols], ["AUM", "Total MTM"], ["MTM%"],
+            avg_cols=["Avg MTM%"], flag_cols=["Below Avg"])
+        blocks.append({
+            "algo": algo, "type": acct_type, "count": len(g),
+            "avg": f"{avg:.2f}%" if pd.notna(avg) else "—",
+            "html": html,
+        })
+    return blocks
+
+
 def _get_filtered_df(df: pd.DataFrame, form_data) -> tuple[pd.DataFrame, str, dict]:
     """Apply filters to the dataframe based on form data."""
     filtered_df = df.copy()
@@ -1272,6 +1420,7 @@ def _get_filtered_df(df: pd.DataFrame, form_data) -> tuple[pd.DataFrame, str, di
 
 
 _PAGE_DEFAULTS = dict(
+    reports=[],
     summary_html=None, alloc_report_html=None,
     error=None, notice=None, blocks=[], token=None, range_label="",
     date_from="", date_to="", data_token="", data_name="",
@@ -1429,27 +1578,27 @@ def process():
 
     rollup = build_account_rollup(df_range)
 
-    # Per algo/type blocks
-    blocks = []
-    detail_cols = ["Alias", "UserID", "AUM", "Total MTM", "MTM%", "Trading Days", "Broker", "Server"]
-    for (algo, acct_type), g in rollup.groupby(["Algo", "Type"], sort=True):
-        blocks.append({
-            "algo": algo, "type": acct_type, "count": len(g),
-            "html": _table_html(g[detail_cols], ["AUM", "Total MTM"], ["MTM%"]),
+    # Build three scoped reports: Overall, 1CR & above, Below 1CR.
+    reports = []
+    for key, label, icon, rl in _scope_rollups(rollup):
+        raw_scope = _scope_raw(df_range, rl)
+        token = uuid.uuid4().hex
+        _EXCEL_CACHE[token] = (
+            f"int_pos_{key}_{d_from}_{d_to}.xlsx", build_excel(rl, raw_scope))
+        reports.append({
+            "key": key, "label": label, "icon": icon, "count": len(rl),
+            "token": token,
+            "summary_html": _render_summary(rl) if not rl.empty else "",
+            "alloc_report_html": _alloc_report_html(compute_alloc_report(rl)),
+            "blocks": build_detail_blocks(rl),
         })
 
-    summary_html = _render_summary(rollup)
-    alloc_report_html = _alloc_report_html(compute_alloc_report(rollup))
-
-    token = uuid.uuid4().hex
-    _EXCEL_CACHE[token] = (f"int_pos_{d_from}_{d_to}.xlsx", build_excel(rollup, df_range))
-    if len(_EXCEL_CACHE) > 20:
-        for k in list(_EXCEL_CACHE)[:-20]:
+    if len(_EXCEL_CACHE) > 30:
+        for k in list(_EXCEL_CACHE)[:-30]:
             _EXCEL_CACHE.pop(k, None)
 
     return _page(
-        summary_html=summary_html, alloc_report_html=alloc_report_html,
-        blocks=blocks, token=token,
+        reports=reports,
         range_label=f"{d_from} to {d_to}",
         date_from=df_from, date_to=df_to,
         users_html=users_html, brokers_html=brokers_html,
