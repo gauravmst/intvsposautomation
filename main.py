@@ -227,20 +227,23 @@ def build_excel(rollup: pd.DataFrame, raw: pd.DataFrame) -> bytes:
     ws_sum.title = "Summary"
 
     ws_data = wb.create_sheet("Data")
-    ws_data.append(["Date", "Algo", "Alias", "UserID", "Allocation", "MTM_all"])
-    sub = raw.reindex(columns=["date", "algo", "alias", "user_id", "allocation", "mtm_all"])
+    ws_data.append(["Date", "Algo", "Alias", "UserID", "Allocation", "MTM_all", "DTE"])
+    sub = raw.reindex(columns=["date", "algo", "alias", "user_id", "allocation",
+                               "mtm_all", "dte"])
     for row in sub.itertuples(index=False):
         d = row.date
         d = d.to_pydatetime() if pd.notna(d) else None
         ws_data.append([d, _cell_val(row.algo), _cell_val(row.alias), _cell_val(row.user_id),
-                        _cell_val(row.allocation), _cell_val(row.mtm_all)])
+                        _cell_val(row.allocation), _cell_val(row.mtm_all),
+                        _cell_val(row.dte)])
     data_last = len(sub) + 1
     for r in range(2, data_last + 1):
         ws_data.cell(r, 1).number_format = "yyyy-mm-dd"
         ws_data.cell(r, 5).number_format = MONEY_FMT
         ws_data.cell(r, 6).number_format = MONEY_FMT
-    _style_header(ws_data, 6)
-    for col, w in zip("ABCDEF", (13, 10, 22, 12, 16, 16)):
+        ws_data.cell(r, 7).alignment = CENTER
+    _style_header(ws_data, 7)
+    for col, w in zip("ABCDEFG", (13, 10, 22, 12, 16, 16, 14)):
         ws_data.column_dimensions[col].width = w
 
     algo_rng = f"Data!$B$2:$B${data_last}"
@@ -914,6 +917,13 @@ _PAGE_DEFAULTS = dict(
 )
 
 
+def _reset_upload_state() -> None:
+    """Clear prior upload, filter, and download caches so a fresh upload starts clean."""
+    _DATA_CACHE.clear()
+    _FILTER_CACHE.clear()
+    _EXCEL_CACHE.clear()
+
+
 def _page(**kw):
     return render_template_string(PAGE, **{**_PAGE_DEFAULTS, **kw})
 
@@ -932,6 +942,7 @@ def process():
     if f and f.filename:
         raw = f.read()
         data_name = f.filename
+        _reset_upload_state()
         data_token = uuid.uuid4().hex
         _DATA_CACHE[data_token] = (data_name, raw)
         if len(_DATA_CACHE) > 5:

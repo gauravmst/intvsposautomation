@@ -83,10 +83,21 @@ def build_account_rollup(df: pd.DataFrame) -> pd.DataFrame:
     """One row per (algo, user_id): classification + aggregated numbers."""
     rows = []
     df_sorted = df.sort_values("date")
+    # A client running several algos still deploys ONE pot of capital, so the
+    # per-algo average allocation must not be summed across algos: 2CR on algo 1
+    # for 4 days plus 2CR on algo 7 for 3 days is 2CR of client money, not 4CR.
+    # "Weighted AUM" spreads each algo's allocation-days over the number of days
+    # the client traded anything, so the per-algo shares add back up to the
+    # client's true average deployed capital.  "AUM" stays the nominal per-algo
+    # average, which is what the allocation buckets and the 1CR split key off.
+    user_days = (df_sorted.dropna(subset=["date"])
+                 .groupby("user_id")["date"].nunique().to_dict())
     for (algo, uid), g in df_sorted.groupby(["algo", "user_id"], sort=False):
         acct_type = classify_type(g["dte"])
         last = g.iloc[-1]
         aum = g["allocation"].mean() * 100
+        days = int(user_days.get(uid, 0)) or len(g)
+        w_aum = (g["allocation"].sum() * 100 / days) if days else float("nan")
         total_mtm = g["mtm_all"].sum()
         mtm_pct = (total_mtm / aum * 100) if aum else float("nan")
         rows.append(
@@ -96,6 +107,8 @@ def build_account_rollup(df: pd.DataFrame) -> pd.DataFrame:
                 "Alias": last.get("alias"),
                 "UserID": uid,
                 "AUM": aum,
+                "Weighted AUM": w_aum,
+                "User Days": days,
                 "Total MTM": total_mtm,
                 "MTM%": mtm_pct,
                 "Trading Days": len(g),
@@ -115,7 +128,7 @@ def build_summary(rollup: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     grp = rollup.groupby(["Algo", "Type"], as_index=False).agg(
         Accounts=("Alias", "count"),
-        Total_AUM=("AUM", "sum"),
+        Total_AUM=("Weighted AUM", "sum"),   # de-duplicated client capital
         Total_MTM=("Total MTM", "sum"),
     )
     grp["MTM%"] = grp.apply(
@@ -228,20 +241,23 @@ def build_excel(rollup: pd.DataFrame, raw: pd.DataFrame) -> bytes:
     ws_sum.title = "Summary"
 
     ws_data = wb.create_sheet("Data")
-    ws_data.append(["Date", "Algo", "Alias", "UserID", "Allocation", "MTM_all"])
-    sub = raw.reindex(columns=["date", "algo", "alias", "user_id", "allocation", "mtm_all"])
+    ws_data.append(["Date", "Algo", "Alias", "UserID", "Allocation", "MTM_all", "DTE"])
+    sub = raw.reindex(columns=["date", "algo", "alias", "user_id", "allocation",
+                               "mtm_all", "dte"])
     for row in sub.itertuples(index=False):
         d = row.date
         d = d.to_pydatetime() if pd.notna(d) else None
         ws_data.append([d, _cell_val(row.algo), _cell_val(row.alias), _cell_val(row.user_id),
-                        _cell_val(row.allocation), _cell_val(row.mtm_all)])
+                        _cell_val(row.allocation), _cell_val(row.mtm_all),
+                        _cell_val(row.dte)])
     data_last = len(sub) + 1
     for r in range(2, data_last + 1):
         ws_data.cell(r, 1).number_format = "yyyy-mm-dd"
         ws_data.cell(r, 5).number_format = MONEY_FMT
         ws_data.cell(r, 6).number_format = MONEY_FMT
-    _style_header(ws_data, 6)
-    for col, w in zip("ABCDEF", (13, 10, 22, 12, 16, 16)):
+        ws_data.cell(r, 7).alignment = CENTER
+    _style_header(ws_data, 7)
+    for col, w in zip("ABCDEFG", (13, 10, 22, 12, 16, 16, 14)):
         ws_data.column_dimensions[col].width = w
 
     algo_rng = f"Data!$B$2:$B${data_last}"
@@ -249,8 +265,22 @@ def build_excel(rollup: pd.DataFrame, raw: pd.DataFrame) -> bytes:
     alloc_rng = f"Data!$E$2:$E${data_last}"
     mtm_rng = f"Data!$F$2:$F${data_last}"
 
-    headers = ["Alias", "UserID", "AUM", "Total MTM", "MTM%", "Avg MTM%", "Below Avg",
-               "Trading Days", "Broker", "Server"]
+    # Distinct days each client traded (across every algo).  Dividing a client's
+    # allocation-days by this turns the per-algo averages into shares that add up
+    # to the client's real deployed capital instead of multiplying it per algo.
+    ws_users = wb.create_sheet("Users")
+    ws_users.append(["UserID", "Trading Days"])
+    if not rollup.empty and "User Days" in rollup.columns:
+        seen = rollup.drop_duplicates(subset=["UserID"])
+        for _, u in seen.iterrows():
+            ws_users.append([_cell_val(u["UserID"]), _cell_val(u["User Days"])])
+    _style_header(ws_users, 2)
+    ws_users.column_dimensions["A"].width = 16
+    ws_users.column_dimensions["B"].width = 14
+    days_lookup = "Users!$A:$B"
+
+    headers = ["Alias", "UserID", "AUM", "Weighted AUM", "Total MTM", "MTM%",
+               "Avg MTM%", "Below Avg", "Trading Days", "Broker", "Server"]
     summary_rows = []
 
     if not rollup.empty:
@@ -260,10 +290,11 @@ def build_excel(rollup: pd.DataFrame, raw: pd.DataFrame) -> bytes:
             ws.append(headers)
             algo_lit = _algo_criteria(algo)
             last_data = 1 + len(g)  # last data row index (row 1 is header)
-            # AUM-weighted MTM% for the block = SUM(Total MTM) / SUM(AUM) * 100,
-            # i.e. the same figure as the TOTAL row's MTM%.
-            wavg_formula = (f'=IFERROR(SUM($D$2:$D${last_data})/'
-                            f'SUM($C$2:$C${last_data})*100,"")')
+            # Block MTM% = SUM(Total MTM) / SUM(Weighted AUM) * 100, i.e. the
+            # same figure as the TOTAL row's MTM%.  The weighted column is the
+            # one that is safe to add up across accounts and algos.
+            wavg_formula = (f'=IFERROR(SUM($E$2:$E${last_data})/'
+                            f'SUM($D$2:$D${last_data})*100,"")')
 
             r = 2
             for _, rec in g.iterrows():
@@ -271,35 +302,41 @@ def build_excel(rollup: pd.DataFrame, raw: pd.DataFrame) -> bytes:
                 ws.cell(r, 2, _cell_val(rec.get("UserID")))
                 ws.cell(r, 3, (f"=IFERROR(AVERAGEIFS({alloc_rng},{algo_rng},"
                                f"{algo_lit},{uid_rng},$B{r})*100,0)"))
-                ws.cell(r, 4, (f"=SUMIFS({mtm_rng},{algo_rng},{algo_lit},"
+                ws.cell(r, 4, (f"=IFERROR(SUMIFS({alloc_rng},{algo_rng},{algo_lit},"
+                               f"{uid_rng},$B{r})*100/"
+                               f"VLOOKUP($B{r},{days_lookup},2,FALSE),0)"))
+                ws.cell(r, 5, (f"=SUMIFS({mtm_rng},{algo_rng},{algo_lit},"
                                f"{uid_rng},$B{r})"))
-                ws.cell(r, 5, f'=IF(C{r}=0,"",D{r}/C{r}*100)')
-                ws.cell(r, 6, wavg_formula)
-                ws.cell(r, 7, f'=IF(AND(ISNUMBER(E{r}),ISNUMBER(F{r}),E{r}<F{r}),TRUE,FALSE)')
-                ws.cell(r, 8, _cell_val(rec.get("Trading Days")))
-                ws.cell(r, 9, _cell_val(rec.get("Broker")))
-                ws.cell(r, 10, _cell_val(rec.get("Server")))
+                ws.cell(r, 6, f'=IF(C{r}=0,"",E{r}/C{r}*100)')
+                ws.cell(r, 7, wavg_formula)
+                ws.cell(r, 8, f'=IF(AND(ISNUMBER(F{r}),ISNUMBER(G{r}),F{r}<G{r}),TRUE,FALSE)')
+                ws.cell(r, 9, _cell_val(rec.get("Trading Days")))
+                ws.cell(r, 10, _cell_val(rec.get("Broker")))
+                ws.cell(r, 11, _cell_val(rec.get("Server")))
                 r += 1
 
             tr = r
             ws.cell(tr, 1, "TOTAL")
             ws.cell(tr, 3, f"=SUM(C2:C{tr - 1})")
             ws.cell(tr, 4, f"=SUM(D2:D{tr - 1})")
-            ws.cell(tr, 5, f'=IF(C{tr}=0,"",D{tr}/C{tr}*100)')
-            ws.cell(tr, 6, wavg_formula)
+            ws.cell(tr, 5, f"=SUM(E2:E{tr - 1})")
+            ws.cell(tr, 6, f'=IF(D{tr}=0,"",E{tr}/D{tr}*100)')
+            ws.cell(tr, 7, wavg_formula)
 
             for rr in range(2, tr + 1):
                 ws.cell(rr, 3).number_format = MONEY_FMT
                 ws.cell(rr, 4).number_format = MONEY_FMT
-                ws.cell(rr, 5).number_format = PCT_FMT
+                ws.cell(rr, 5).number_format = MONEY_FMT
                 ws.cell(rr, 6).number_format = PCT_FMT
-                ws.cell(rr, 7).alignment = CENTER
-            for c in range(1, 11):
+                ws.cell(rr, 7).number_format = PCT_FMT
+                ws.cell(rr, 8).alignment = CENTER
+            for c in range(1, 12):
                 ws.cell(tr, c).font = TOTAL_FONT
                 ws.cell(tr, c).border = TOTAL_TOP
-            _style_header(ws, 10)
-            _add_sign_colors(ws, [f"D2:D{tr}", f"E2:E{tr}", f"F2:F{tr}"])
-            for col, w in zip("ABCDEFGHIJ", (20, 16, 14, 14, 11, 11, 11, 13, 16, 14)):
+            _style_header(ws, 11)
+            _add_sign_colors(ws, [f"E2:E{tr}", f"F2:F{tr}", f"G2:G{tr}"])
+            for col, w in zip("ABCDEFGHIJK",
+                              (20, 16, 14, 15, 14, 11, 11, 11, 13, 16, 14)):
                 ws.column_dimensions[col].width = w
 
             summary_rows.append((algo, acct_type, len(g), sheet, tr))
@@ -317,8 +354,8 @@ def build_excel(rollup: pd.DataFrame, raw: pd.DataFrame) -> bytes:
             ws_sum.cell(r, 1, _cell_val(algo))
             ws_sum.cell(r, 2, acct_type)
             ws_sum.cell(r, 3, count)
-            ws_sum.cell(r, 4, f"='{sheet}'!C{tr}")
-            ws_sum.cell(r, 5, f"='{sheet}'!D{tr}")
+            ws_sum.cell(r, 4, f"='{sheet}'!D{tr}")
+            ws_sum.cell(r, 5, f"='{sheet}'!E{tr}")
             ws_sum.cell(r, 6, f'=IF(D{r}=0,"",E{r}/D{r}*100)')
             for c in range(1, 7):
                 ws_sum.cell(r, c).fill = light_fill
@@ -383,6 +420,7 @@ def build_excel(rollup: pd.DataFrame, raw: pd.DataFrame) -> bytes:
     write_alloc_sheet(ws_alloc, compute_alloc_report(rollup))
     wb.move_sheet(ws_alloc, offset=1 - wb.sheetnames.index("Allocation Report"))
 
+    wb.move_sheet(ws_users, offset=len(wb.sheetnames) - 1 - wb.sheetnames.index("Users"))
     wb.move_sheet(ws_data, offset=len(wb.sheetnames) - 1 - wb.sheetnames.index("Data"))
     wb.active = 0
 
@@ -1017,7 +1055,8 @@ def _render_summary(rollup: pd.DataFrame) -> str:
     if rollup.empty:
         return ""
     g = (rollup.groupby(["Algo", "Type"], as_index=False)
-         .agg(Accounts=("Alias", "count"), AUM=("AUM", "sum"), MTM=("Total MTM", "sum")))
+         .agg(Accounts=("Alias", "count"), AUM=("Weighted AUM", "sum"),
+              MTM=("Total MTM", "sum")))
     g = g.sort_values(["Algo", "Type"]).reset_index(drop=True)
 
     def money(x):
@@ -1115,7 +1154,7 @@ def compute_alloc_report(rollup: pd.DataFrame):
     """Aggregate MTM and AUM into (Type, Algo, bucket) cells for the report."""
     if rollup is None or rollup.empty:
         return None
-    r = rollup.dropna(subset=["AUM", "Total MTM"]).copy()
+    r = rollup.dropna(subset=["AUM", "Weighted AUM", "Total MTM"]).copy()
     if r.empty:
         return None
 
@@ -1127,7 +1166,10 @@ def compute_alloc_report(rollup: pd.DataFrame):
 
     for _, row in r.iterrows():
         typ, algo = row["Type"], row["Algo"]
+        # Bucket by the nominal allocation the client is on; total the
+        # de-duplicated share so a multi-algo client is not counted twice.
         aum, mtm = float(row["AUM"]), float(row["Total MTM"])
+        w_aum = float(row["Weighted AUM"])
         if algo == ALGO8:
             lbl = _algo8_bucket_label(aum)
             bucket = algo8.setdefault(typ, {})
@@ -1139,7 +1181,7 @@ def compute_alloc_report(rollup: pd.DataFrame):
             bucket = std.setdefault((typ, algo), {})
         cell = bucket.setdefault(lbl, [0.0, 0.0])
         cell[0] += mtm
-        cell[1] += aum
+        cell[1] += w_aum
 
     std_labels = [l for l, _ in STD_BUCKETS] + ([OVERFLOW_LABEL] if has_overflow else [])
     return {
@@ -1320,8 +1362,8 @@ THRESH_1CR = 10_000_000  # AUM = allocation * 100, so 1CR = 10,000,000
 
 # Columns shown in each per-algo/type detail table, including the two new
 # analysis columns: the peer-group average MTM% and the below-average flag.
-DETAIL_COLS = ["Alias", "UserID", "AUM", "Total MTM", "MTM%", "Avg MTM%", "Below Avg",
-               "Trading Days", "Broker", "Server"]
+DETAIL_COLS = ["Alias", "UserID", "AUM", "Weighted AUM", "Total MTM", "MTM%",
+               "Avg MTM%", "Below Avg", "Trading Days", "Broker", "Server"]
 
 
 def _scope_rollups(rollup: pd.DataFrame):
@@ -1363,14 +1405,14 @@ def build_detail_blocks(rollup: pd.DataFrame) -> list:
         return blocks
     for (algo, acct_type), g in rollup.groupby(["Algo", "Type"], sort=True):
         g = g.copy()
-        tot_aum = g["AUM"].sum()
+        tot_aum = g["Weighted AUM"].sum()
         tot_mtm = g["Total MTM"].sum()
         avg = (tot_mtm / tot_aum * 100) if tot_aum else float("nan")
         g["Avg MTM%"] = avg
         g["Below Avg"] = g["MTM%"] < avg  # NaN compares False
         cols = [c for c in DETAIL_COLS if c in g.columns]
         html = _table_html(
-            g[cols], ["AUM", "Total MTM"], ["MTM%"],
+            g[cols], ["AUM", "Weighted AUM", "Total MTM"], ["MTM%"],
             avg_cols=["Avg MTM%"], flag_cols=["Below Avg"])
         blocks.append({
             "algo": algo, "type": acct_type, "count": len(g),
@@ -1429,6 +1471,13 @@ _PAGE_DEFAULTS = dict(
 )
 
 
+def _reset_upload_state() -> None:
+    """Clear prior upload, filter, and download caches so a fresh upload starts clean."""
+    _DATA_CACHE.clear()
+    _FILTER_CACHE.clear()
+    _EXCEL_CACHE.clear()
+
+
 def _page(**kw):
     return render_template_string(PAGE, **{**_PAGE_DEFAULTS, **kw})
 
@@ -1447,6 +1496,7 @@ def process():
     if f and f.filename:
         raw = f.read()
         data_name = f.filename
+        _reset_upload_state()
         data_token = uuid.uuid4().hex
         _DATA_CACHE[data_token] = (data_name, raw)
         if len(_DATA_CACHE) > 5:
