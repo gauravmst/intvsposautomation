@@ -89,7 +89,7 @@ def build_account_rollup(df: pd.DataFrame) -> pd.DataFrame:
     # "Weighted AUM" spreads each algo's allocation-days over the number of days
     # the client traded anything, so the per-algo shares add back up to the
     # client's true average deployed capital.  "AUM" stays the nominal per-algo
-    # average, which is what the allocation buckets and the 1CR split key off.
+    # average, which is what the allocation buckets and the 1.25CR split key off.
     user_days = (df_sorted.dropna(subset=["date"])
                  .groupby("user_id")["date"].nunique().to_dict())
     for (algo, uid), g in df_sorted.groupby(["algo", "user_id"], sort=False):
@@ -1114,26 +1114,26 @@ def _render_summary(rollup: pd.DataFrame) -> str:
 # A pivot: two sections (POS / INT) -> rows = Algo -> columns = allocation
 # bucket, each cell = AUM-weighted MTM% (sum of MTM / sum of AUM * 100) for the
 # accounts landing in that Algo + Type + bucket. AUM = allocation * 100, so
-# allocation 20k -> 20L ... 180k -> 1.8CR.  Algo 8 lives at crore-level
+# allocation 25k -> 25L ... 225k -> 2.25CR.  Algo 8 lives at crore-level
 # allocations, so instead of one column each it is split into ODD (3,5,7,9 CR)
 # vs EVEN (2,4,6,8 CR) crore buckets.
 
 ALGO8 = 8
-STD_STEP = 2_000_000                     # 20L step in AUM terms
-STD_MAX = 18_000_000                     # top of the fixed ladder = 1.8CR
+STD_STEP = 2_500_000                     # 25L step in AUM terms
+STD_MAX = 22_500_000                     # top of the fixed ladder = 2.25CR
 STD_BUCKETS = [                          # (label, AUM value)
-    ("20L", 2_000_000), ("40L", 4_000_000), ("60L", 6_000_000),
-    ("80L", 8_000_000), ("1CR", 10_000_000), ("1.2CR", 12_000_000),
-    ("1.4CR", 14_000_000), ("1.6CR", 16_000_000), ("1.8CR", 18_000_000),
+    ("25L", 2_500_000), ("50L", 5_000_000), ("75L", 7_500_000),
+    ("1CR", 10_000_000), ("1.25CR", 12_500_000), ("1.5CR", 15_000_000),
+    ("1.75CR", 17_500_000), ("2CR", 20_000_000), ("2.25CR", 22_500_000),
 ]
 STD_BUCKET_VALUES = {v: l for l, v in STD_BUCKETS}
-OVERFLOW_LABEL = "≥2CR"
+OVERFLOW_LABEL = "≥2.5CR"
 ALGO8_ODD_LABEL = "ODD (3,5,7,9 CR)"
 ALGO8_EVEN_LABEL = "EVEN (2,4,6,8 CR)"
 
 
 def _std_bucket_label(aum: float) -> str:
-    """Map an account's AUM to the nearest 20L rung of the fixed ladder."""
+    """Map an account's AUM to the nearest 25L rung of the fixed ladder."""
     rounded = int(round(aum / STD_STEP)) * STD_STEP
     if rounded < STD_STEP:
         rounded = STD_STEP
@@ -1355,10 +1355,10 @@ def write_alloc_sheet(ws, rep):
 
 
 # ---------------------------------------------------------------------------
-# Scoped reports (Overall / 1CR+ / Below 1CR) + per-account detail blocks
+# Scoped reports (Overall / 1.25CR+ / Below 1.25CR) + per-account detail blocks
 # ---------------------------------------------------------------------------
 
-THRESH_1CR = 10_000_000  # AUM = allocation * 100, so 1CR = 10,000,000
+THRESH_125CR = 12_500_000  # AUM = allocation * 100, so 1.25CR = 12,500,000
 
 # Columns shown in each per-algo/type detail table, including the two new
 # analysis columns: the peer-group average MTM% and the below-average flag.
@@ -1372,14 +1372,14 @@ def _scope_rollups(rollup: pd.DataFrame):
         empty = rollup if rollup is not None else pd.DataFrame()
         return [
             ("overall", "Overall", "🌐", empty),
-            ("ge1cr", "1CR & above", "💎", empty),
-            ("lt1cr", "Below 1CR", "🔹", empty),
+            ("ge125cr", "1.25CR & above", "💎", empty),
+            ("lt125cr", "Below 1.25CR", "🔹", empty),
         ]
     aum = rollup["AUM"]
     return [
         ("overall", "Overall", "🌐", rollup),
-        ("ge1cr", "1CR & above", "💎", rollup[aum >= THRESH_1CR]),
-        ("lt1cr", "Below 1CR", "🔹", rollup[aum < THRESH_1CR]),
+        ("ge125cr", "1.25CR & above", "💎", rollup[aum >= THRESH_125CR]),
+        ("lt125cr", "Below 1.25CR", "🔹", rollup[aum < THRESH_125CR]),
     ]
 
 
@@ -1628,7 +1628,7 @@ def process():
 
     rollup = build_account_rollup(df_range)
 
-    # Build three scoped reports: Overall, 1CR & above, Below 1CR.
+    # Build three scoped reports: Overall, 1.25CR & above, Below 1.25CR.
     reports = []
     for key, label, icon, rl in _scope_rollups(rollup):
         raw_scope = _scope_raw(df_range, rl)
