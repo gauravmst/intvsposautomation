@@ -25,6 +25,7 @@ from flask import Flask, request, render_template_string, send_file, abort, json
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.formatting.rule import CellIsRule
+from openpyxl.utils import get_column_letter
 
 # ---------------------------------------------------------------------------
 # Core logic
@@ -39,7 +40,7 @@ def dte_numbers(value) -> list[int]:
         return []
     return [int(n) for n in DTE_NUM_RE.findall(str(value))]
 
-
+#special jo acc 0 se start hote h 
 def normalize_target_user_id(value):
     """Collapse known leading-zero variants of a user_id onto one canonical form."""
     normalized = str(value).strip()
@@ -82,10 +83,21 @@ def build_account_rollup(df: pd.DataFrame) -> pd.DataFrame:
     """One row per (algo, user_id): classification + aggregated numbers."""
     rows = []
     df_sorted = df.sort_values("date")
+    # A client running several algos still deploys ONE pot of capital, so the
+    # per-algo average allocation must not be summed across algos: 2CR on algo 1
+    # for 4 days plus 2CR on algo 7 for 3 days is 2CR of client money, not 4CR.
+    # "Weighted AUM" spreads each algo's allocation-days over the number of days
+    # the client traded anything, so the per-algo shares add back up to the
+    # client's true average deployed capital.  "AUM" stays the nominal per-algo
+    # average, which is what the allocation buckets and the 1.25CR split key off.
+    user_days = (df_sorted.dropna(subset=["date"])
+                 .groupby("user_id")["date"].nunique().to_dict())
     for (algo, uid), g in df_sorted.groupby(["algo", "user_id"], sort=False):
         acct_type = classify_type(g["dte"])
         last = g.iloc[-1]
         aum = g["allocation"].mean() * 100
+        days = int(user_days.get(uid, 0)) or len(g)
+        w_aum = (g["allocation"].sum() * 100 / days) if days else float("nan")
         total_mtm = g["mtm_all"].sum()
         mtm_pct = (total_mtm / aum * 100) if aum else float("nan")
         rows.append(
@@ -95,6 +107,8 @@ def build_account_rollup(df: pd.DataFrame) -> pd.DataFrame:
                 "Alias": last.get("alias"),
                 "UserID": uid,
                 "AUM": aum,
+                "Weighted AUM": w_aum,
+                "User Days": days,
                 "Total MTM": total_mtm,
                 "MTM%": mtm_pct,
                 "Trading Days": len(g),
@@ -114,7 +128,7 @@ def build_summary(rollup: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     grp = rollup.groupby(["Algo", "Type"], as_index=False).agg(
         Accounts=("Alias", "count"),
-        Total_AUM=("AUM", "sum"),
+        Total_AUM=("Weighted AUM", "sum"),   # de-duplicated client capital
         Total_MTM=("Total MTM", "sum"),
     )
     grp["MTM%"] = grp.apply(
@@ -251,8 +265,22 @@ def build_excel(rollup: pd.DataFrame, raw: pd.DataFrame) -> bytes:
     alloc_rng = f"Data!$E$2:$E${data_last}"
     mtm_rng = f"Data!$F$2:$F${data_last}"
 
-    headers = ["Alias", "UserID", "AUM", "Total MTM", "MTM%",
-               "Trading Days", "Broker", "Server"]
+    # Distinct days each client traded (across every algo).  Dividing a client's
+    # allocation-days by this turns the per-algo averages into shares that add up
+    # to the client's real deployed capital instead of multiplying it per algo.
+    ws_users = wb.create_sheet("Users")
+    ws_users.append(["UserID", "Trading Days"])
+    if not rollup.empty and "User Days" in rollup.columns:
+        seen = rollup.drop_duplicates(subset=["UserID"])
+        for _, u in seen.iterrows():
+            ws_users.append([_cell_val(u["UserID"]), _cell_val(u["User Days"])])
+    _style_header(ws_users, 2)
+    ws_users.column_dimensions["A"].width = 16
+    ws_users.column_dimensions["B"].width = 14
+    days_lookup = "Users!$A:$B"
+
+    headers = ["Alias", "UserID", "AUM", "Weighted AUM", "Total MTM", "MTM%",
+               "Avg MTM%", "Below Avg", "Trading Days", "Broker", "Server"]
     summary_rows = []
 
     if not rollup.empty:
@@ -261,6 +289,12 @@ def build_excel(rollup: pd.DataFrame, raw: pd.DataFrame) -> bytes:
             ws = wb.create_sheet(sheet)
             ws.append(headers)
             algo_lit = _algo_criteria(algo)
+            last_data = 1 + len(g)  # last data row index (row 1 is header)
+            # Block MTM% = SUM(Total MTM) / SUM(Weighted AUM) * 100, i.e. the
+            # same figure as the TOTAL row's MTM%.  The weighted column is the
+            # one that is safe to add up across accounts and algos.
+            wavg_formula = (f'=IFERROR(SUM($E$2:$E${last_data})/'
+                            f'SUM($D$2:$D${last_data})*100,"")')
 
             r = 2
             for _, rec in g.iterrows():
@@ -268,30 +302,41 @@ def build_excel(rollup: pd.DataFrame, raw: pd.DataFrame) -> bytes:
                 ws.cell(r, 2, _cell_val(rec.get("UserID")))
                 ws.cell(r, 3, (f"=IFERROR(AVERAGEIFS({alloc_rng},{algo_rng},"
                                f"{algo_lit},{uid_rng},$B{r})*100,0)"))
-                ws.cell(r, 4, (f"=SUMIFS({mtm_rng},{algo_rng},{algo_lit},"
+                ws.cell(r, 4, (f"=IFERROR(SUMIFS({alloc_rng},{algo_rng},{algo_lit},"
+                               f"{uid_rng},$B{r})*100/"
+                               f"VLOOKUP($B{r},{days_lookup},2,FALSE),0)"))
+                ws.cell(r, 5, (f"=SUMIFS({mtm_rng},{algo_rng},{algo_lit},"
                                f"{uid_rng},$B{r})"))
-                ws.cell(r, 5, f'=IF(C{r}=0,"",D{r}/C{r}*100)')
-                ws.cell(r, 6, _cell_val(rec.get("Trading Days")))
-                ws.cell(r, 7, _cell_val(rec.get("Broker")))
-                ws.cell(r, 8, _cell_val(rec.get("Server")))
+                ws.cell(r, 6, f'=IF(C{r}=0,"",E{r}/C{r}*100)')
+                ws.cell(r, 7, wavg_formula)
+                ws.cell(r, 8, f'=IF(AND(ISNUMBER(F{r}),ISNUMBER(G{r}),F{r}<G{r}),TRUE,FALSE)')
+                ws.cell(r, 9, _cell_val(rec.get("Trading Days")))
+                ws.cell(r, 10, _cell_val(rec.get("Broker")))
+                ws.cell(r, 11, _cell_val(rec.get("Server")))
                 r += 1
 
             tr = r
             ws.cell(tr, 1, "TOTAL")
             ws.cell(tr, 3, f"=SUM(C2:C{tr - 1})")
             ws.cell(tr, 4, f"=SUM(D2:D{tr - 1})")
-            ws.cell(tr, 5, f'=IF(C{tr}=0,"",D{tr}/C{tr}*100)')
+            ws.cell(tr, 5, f"=SUM(E2:E{tr - 1})")
+            ws.cell(tr, 6, f'=IF(D{tr}=0,"",E{tr}/D{tr}*100)')
+            ws.cell(tr, 7, wavg_formula)
 
             for rr in range(2, tr + 1):
                 ws.cell(rr, 3).number_format = MONEY_FMT
                 ws.cell(rr, 4).number_format = MONEY_FMT
-                ws.cell(rr, 5).number_format = PCT_FMT
-            for c in range(1, 9):
+                ws.cell(rr, 5).number_format = MONEY_FMT
+                ws.cell(rr, 6).number_format = PCT_FMT
+                ws.cell(rr, 7).number_format = PCT_FMT
+                ws.cell(rr, 8).alignment = CENTER
+            for c in range(1, 12):
                 ws.cell(tr, c).font = TOTAL_FONT
                 ws.cell(tr, c).border = TOTAL_TOP
-            _style_header(ws, 8)
-            _add_sign_colors(ws, [f"D2:D{tr}", f"E2:E{tr}"])
-            for col, w in zip("ABCDEFGH", (20, 16, 14, 14, 11, 13, 16, 14)):
+            _style_header(ws, 11)
+            _add_sign_colors(ws, [f"E2:E{tr}", f"F2:F{tr}", f"G2:G{tr}"])
+            for col, w in zip("ABCDEFGHIJK",
+                              (20, 16, 14, 15, 14, 11, 11, 11, 13, 16, 14)):
                 ws.column_dimensions[col].width = w
 
             summary_rows.append((algo, acct_type, len(g), sheet, tr))
@@ -309,8 +354,8 @@ def build_excel(rollup: pd.DataFrame, raw: pd.DataFrame) -> bytes:
             ws_sum.cell(r, 1, _cell_val(algo))
             ws_sum.cell(r, 2, acct_type)
             ws_sum.cell(r, 3, count)
-            ws_sum.cell(r, 4, f"='{sheet}'!C{tr}")
-            ws_sum.cell(r, 5, f"='{sheet}'!D{tr}")
+            ws_sum.cell(r, 4, f"='{sheet}'!D{tr}")
+            ws_sum.cell(r, 5, f"='{sheet}'!E{tr}")
             ws_sum.cell(r, 6, f'=IF(D{r}=0,"",E{r}/D{r}*100)')
             for c in range(1, 7):
                 ws_sum.cell(r, c).fill = light_fill
@@ -370,6 +415,12 @@ def build_excel(rollup: pd.DataFrame, raw: pd.DataFrame) -> bytes:
     for col, w in zip("ABCDEF", (14, 8, 12, 18, 18, 10)):
         ws_sum.column_dimensions[col].width = w
 
+    # Allocation × MTM% analysis sheet (placed right after Summary).
+    ws_alloc = wb.create_sheet("Allocation Report")
+    write_alloc_sheet(ws_alloc, compute_alloc_report(rollup))
+    wb.move_sheet(ws_alloc, offset=1 - wb.sheetnames.index("Allocation Report"))
+
+    wb.move_sheet(ws_users, offset=len(wb.sheetnames) - 1 - wb.sheetnames.index("Users"))
     wb.move_sheet(ws_data, offset=len(wb.sheetnames) - 1 - wb.sheetnames.index("Data"))
     wb.active = 0
 
@@ -433,42 +484,89 @@ PAGE = """
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>INT / POS Algo Calculator</title>
+  <script>
+    /* Apply saved theme BEFORE first paint to avoid a flash of the wrong theme. */
+    (function () {
+      try {
+        var t = localStorage.getItem('theme');
+        if (!t) t = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+        document.documentElement.setAttribute('data-theme', t);
+      } catch (e) {
+        document.documentElement.setAttribute('data-theme', 'dark');
+      }
+    })();
+  </script>
   <style>
-    :root {
+    /* ---------- Theme tokens ---------- */
+    :root, :root[data-theme="dark"] {
       --bg:#0b1120; --bg2:#0f172a; --card:#151f34; --card2:#1a2540;
       --ink:#e8eefc; --muted:#8ea0bf; --accent:#38bdf8; --accent2:#818cf8;
       --green:#34d399; --red:#fb7185; --line:#25324e; --line2:#334155;
+      --input:#0a1122; --input2:#0b1220; --chip-ink:#9fc7ff;
+      --glow1:rgba(56,189,248,.10); --glow2:rgba(129,140,248,.12);
+      --card-shadow:0 18px 40px -24px rgba(0,0,0,.7);
+      --hover-tint:rgba(255,255,255,.03); --row-hover:rgba(56,189,248,.06);
+      --h1a:#ffffff; --h1b:#a9c7ff;
     }
+    :root[data-theme="light"] {
+      --bg:#eef2fb; --bg2:#ffffff; --card:#ffffff; --card2:#f3f7fd;
+      --ink:#0f1e38; --muted:#5a6b88; --accent:#0ea5e9; --accent2:#6366f1;
+      --green:#0f9d58; --red:#e11d48; --line:#e3e9f4; --line2:#cdd8ea;
+      --input:#f6f9ff; --input2:#f1f5fd; --chip-ink:#2563eb;
+      --glow1:rgba(14,165,233,.16); --glow2:rgba(99,102,241,.14);
+      --card-shadow:0 18px 40px -26px rgba(30,58,120,.22);
+      --hover-tint:rgba(15,30,60,.04); --row-hover:rgba(14,165,233,.08);
+      --h1a:#0b2a63; --h1b:#3b82f6;
+    }
+
     * { box-sizing:border-box; }
     html { scroll-behavior:smooth; }
     body {
       margin:0; font-family:'Inter',system-ui,Segoe UI,Roboto,Arial,sans-serif;
       color:var(--ink); min-height:100vh;
       background:
-        radial-gradient(900px 500px at 12% -8%, rgba(56,189,248,.10), transparent 60%),
-        radial-gradient(760px 460px at 100% 0%, rgba(129,140,248,.12), transparent 55%),
+        radial-gradient(900px 500px at 12% -8%, var(--glow1), transparent 60%),
+        radial-gradient(760px 460px at 100% 0%, var(--glow2), transparent 55%),
         var(--bg);
+      transition:background-color .45s ease, color .45s ease;
     }
     .wrap { max-width:1240px; margin:0 auto; padding:36px 22px 72px; }
 
+    /* ---------- Header ---------- */
     .head { display:flex; align-items:center; gap:14px; margin-bottom:6px; }
     .logo {
       width:46px; height:46px; border-radius:13px; display:grid; place-items:center;
       font-size:24px; background:linear-gradient(135deg,var(--accent),var(--accent2));
       box-shadow:0 8px 22px rgba(56,189,248,.28);
+      animation:pop .5s cubic-bezier(.2,.9,.3,1.4) both;
     }
     h1 {
       font-size:26px; margin:0; letter-spacing:-.4px; font-weight:800;
-      background:linear-gradient(90deg,#fff,#a9c7ff);
+      background:linear-gradient(90deg,var(--h1a),var(--h1b));
       -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent;
     }
     .sub { color:var(--muted); margin:0 0 26px 60px; font-size:14px; }
 
+    /* ---------- Theme toggle ---------- */
+    .theme-toggle {
+      margin-left:auto; display:inline-flex; align-items:center; gap:9px;
+      background:var(--card); border:1px solid var(--line2); color:var(--ink);
+      border-radius:99px; padding:8px 15px 8px 12px; cursor:pointer; font-weight:700;
+      font-size:13px; box-shadow:var(--card-shadow);
+      transition:transform .15s ease, border-color .2s, background-color .3s;
+    }
+    .theme-toggle:hover { transform:translateY(-1px); border-color:var(--accent); }
+    .theme-toggle .tt-icon { font-size:16px; display:inline-block; transition:transform .5s cubic-bezier(.2,.9,.3,1.4); }
+    .theme-toggle:hover .tt-icon { transform:rotate(40deg) scale(1.1); }
+
+    /* ---------- Cards ---------- */
     .card {
       background:linear-gradient(180deg,var(--card),var(--bg2));
       border:1px solid var(--line); border-radius:16px;
       padding:22px; margin-bottom:24px;
-      box-shadow:0 1px 0 rgba(255,255,255,.03) inset, 0 18px 40px -24px rgba(0,0,0,.7);
+      box-shadow:0 1px 0 rgba(255,255,255,.03) inset, var(--card-shadow);
+      transition:background-color .45s ease, border-color .45s ease, box-shadow .3s;
+      animation:fadeUp .5s ease both;
     }
 
     form { display:flex; flex-wrap:wrap; gap:18px; align-items:end; }
@@ -476,46 +574,59 @@ PAGE = """
     label { font-size:12px; color:var(--muted); margin-bottom:7px; font-weight:600;
             text-transform:uppercase; letter-spacing:.5px; }
     input[type=file], input[type=date] {
-      background:#0a1122; border:1px solid var(--line2); color:var(--ink);
-      border-radius:10px; padding:11px 12px; font-size:14px; transition:border-color .15s, box-shadow .15s;
+      background:var(--input); border:1px solid var(--line2); color:var(--ink);
+      border-radius:10px; padding:11px 12px; font-size:14px;
+      transition:border-color .15s, box-shadow .15s, background-color .3s;
     }
-    input[type=file]:hover, input[type=date]:hover { border-color:#44557a; }
+    input[type=file]:hover, input[type=date]:hover { border-color:var(--accent); }
     input[type=file]:focus, input[type=date]:focus {
       outline:0; border-color:var(--accent); box-shadow:0 0 0 3px rgba(56,189,248,.18);
     }
     input[type=file]::file-selector-button {
-      background:#1c2b48; color:var(--ink); border:0; border-radius:7px;
+      background:var(--card2); color:var(--ink); border:1px solid var(--line2); border-radius:7px;
       padding:7px 12px; margin-right:12px; cursor:pointer; font-weight:600;
+      transition:background-color .2s, transform .1s;
     }
+    input[type=file]::file-selector-button:hover { background:var(--accent); color:#04121f; }
+
     button {
       background:linear-gradient(135deg,var(--accent),var(--accent2)); color:#051426;
       border:0; border-radius:10px; padding:12px 22px; font-weight:800; font-size:14px;
-      cursor:pointer; transition:transform .12s, box-shadow .12s;
+      cursor:pointer; transition:transform .12s, box-shadow .12s, filter .12s;
       box-shadow:0 10px 22px -8px rgba(56,189,248,.6);
     }
-    button:hover { transform:translateY(-1px); box-shadow:0 14px 26px -8px rgba(56,189,248,.7); }
-    button:active { transform:translateY(0); }
+    button:hover { transform:translateY(-1px); box-shadow:0 14px 26px -8px rgba(56,189,248,.7); filter:brightness(1.05); }
+    button:active { transform:translateY(0) scale(.98); }
     .btn-upload { background:linear-gradient(135deg,#6366f1,#818cf8); color:#eef2ff;
                   box-shadow:0 10px 22px -8px rgba(99,102,241,.6); }
     .btn-calc { background:linear-gradient(135deg,var(--green),#10b981); color:#04231a;
                 box-shadow:0 10px 22px -8px rgba(52,211,153,.6); width:100%; margin-top:4px;
                 font-size:15px; padding:14px 22px; }
-    .btn-apply { background:linear-gradient(135deg,#f59e0b,#d97706); color:#051426;
+    .btn-calc:hover { box-shadow:0 14px 26px -8px rgba(52,211,153,.75); }
+    .btn-apply { background:linear-gradient(135deg,#f59e0b,#d97706); color:#3a1d00;
                  box-shadow:0 10px 22px -8px rgba(245,158,11,.6); }
-    .ok { background:rgba(6,95,70,.30); border:1px solid #10b981; color:#d1fae5;
+    .ok { background:linear-gradient(180deg,rgba(16,185,129,.16),rgba(6,95,70,.14));
+          border:1px solid var(--green); color:var(--ink);
           padding:14px 16px; border-radius:12px; }
     .fileinfo { margin-top:7px; font-size:12px; color:var(--green); font-weight:600; }
 
+    /* ---------- Filters ---------- */
     .filters { width:100%; margin-top:15px; }
     .filtergrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; }
     .filterbox { border:1px solid var(--line2); border-radius:12px;
-                 background:#0a1122; padding:12px; }
+                 background:var(--input); padding:12px;
+                 transition:border-color .2s, transform .15s, box-shadow .2s, background-color .3s;
+                 animation:fadeUp .5s ease both; }
+    .filterbox:hover { border-color:var(--accent); transform:translateY(-2px);
+                       box-shadow:0 14px 30px -20px rgba(56,189,248,.5); }
+    .filterbox:nth-child(1){animation-delay:.05s} .filterbox:nth-child(2){animation-delay:.1s}
+    .filterbox:nth-child(3){animation-delay:.15s} .filterbox:nth-child(4){animation-delay:.2s}
     .flabel { display:flex; align-items:center; gap:8px; font-size:11px;
               text-transform:uppercase; letter-spacing:.5px; color:var(--muted);
               font-weight:700; margin-bottom:8px; }
-    .fsearch { width:100%; background:#0b1220; border:1px solid var(--line2);
+    .fsearch { width:100%; background:var(--input2); border:1px solid var(--line2);
                color:var(--ink); border-radius:8px; padding:8px 10px; font-size:13px;
-               margin-bottom:8px; }
+               margin-bottom:8px; transition:border-color .15s, box-shadow .15s; }
     .fsearch:focus { outline:0; border-color:var(--accent);
                      box-shadow:0 0 0 3px rgba(56,189,248,.18); }
     .fselectall { border-bottom:1px solid var(--line2); padding-bottom:8px; margin-bottom:8px; }
@@ -523,19 +634,26 @@ PAGE = """
                         font-weight:700; color:var(--accent); cursor:pointer;
                         text-transform:none; }
     .flist { max-height:160px; overflow:auto; display:flex; flex-direction:column; gap:6px; }
-    .flist .fitem { display:flex; align-items:center; gap:8px; font-size:12px; cursor:pointer; }
-    .flist .fitem span { color:#9fc7ff; word-break:break-all; }
+    .flist .fitem { display:flex; align-items:center; gap:8px; font-size:12px; cursor:pointer;
+                    border-radius:6px; padding:2px 4px; transition:background-color .12s; }
+    .flist .fitem:hover { background:var(--hover-tint); }
+    .flist .fitem span { color:var(--chip-ink); word-break:break-all; }
     .fhint { color:var(--muted); font-size:12px; padding:6px 2px; }
     input[type=checkbox] { accent-color:var(--accent); width:15px; height:15px; cursor:pointer; }
-    
-    .filter-actions { display:flex; gap:12px; margin-top:10px; flex-wrap:wrap; }
-    .filter-qs { display:flex; align-items:center; gap:8px; color:var(--muted);
-                 font-size:13px; font-weight:600; }
+
+    .filter-actions { display:flex; gap:14px; margin-top:12px; flex-wrap:wrap; align-items:center; }
+    .filter-qs { display:flex; align-items:center; gap:8px; color:var(--ink);
+                 font-size:13px; font-weight:600; cursor:pointer;
+                 border:1px solid var(--line2); background:var(--input); border-radius:10px;
+                 padding:9px 14px; transition:border-color .2s, background-color .2s; }
+    .filter-qs:hover { border-color:var(--accent); }
     .filter-qs input[type=checkbox] { width:18px; height:18px; }
 
-    .err { background:rgba(127,29,29,.35); border:1px solid #7f1d1d; color:#fecaca;
+    .err { background:linear-gradient(180deg,rgba(225,29,72,.16),rgba(127,29,29,.16));
+           border:1px solid var(--red); color:var(--ink);
            padding:14px 16px; border-radius:12px; }
 
+    /* ---------- Results ---------- */
     .bar { display:flex; justify-content:space-between; align-items:center;
            flex-wrap:wrap; gap:12px; margin-bottom:16px; }
     .bar h2 { margin:0; font-size:19px; font-weight:700; }
@@ -544,9 +662,9 @@ PAGE = """
       display:inline-flex; align-items:center; gap:7px; text-decoration:none;
       background:linear-gradient(135deg,var(--green),#10b981); color:#04231a;
       padding:11px 18px; border-radius:10px; font-weight:800; font-size:14px;
-      box-shadow:0 10px 22px -10px rgba(52,211,153,.7); transition:transform .12s;
+      box-shadow:0 10px 22px -10px rgba(52,211,153,.7); transition:transform .12s, box-shadow .12s;
     }
-    .dl:hover { transform:translateY(-1px); }
+    .dl:hover { transform:translateY(-1px); box-shadow:0 14px 26px -10px rgba(52,211,153,.8); }
 
     .section-title { font-size:15px; font-weight:700; color:var(--muted);
                      text-transform:uppercase; letter-spacing:.6px; margin:4px 2px 14px; }
@@ -559,11 +677,12 @@ PAGE = """
                background:var(--card2); font-size:11px; text-transform:uppercase;
                letter-spacing:.5px; border-bottom:1px solid var(--line2); }
     tbody tr { transition:background .12s; }
-    tbody tr:hover { background:rgba(56,189,248,.06); }
+    tbody tr:hover { background:var(--row-hover); }
     tr.total td { font-weight:800; border-top:2px solid var(--accent);
-                  background:rgba(56,189,248,.07); }
+                  background:var(--row-hover); }
     .neg { color:var(--red); font-weight:600; } .pos { color:var(--green); font-weight:600; }
 
+    /* Summary stays a "paper" panel (matches the Excel look) in both themes. */
     .sumwrap { background:#ffffff; color:#0f172a; border-radius:12px; padding:2px;
                overflow:auto; box-shadow:0 10px 30px -18px rgba(0,0,0,.6); }
     .sumtbl { border-collapse:collapse; width:100%; font-size:13px; color:#0f172a; }
@@ -575,27 +694,90 @@ PAGE = """
                        font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
     .sumtbl tr.grand td { background:#e2e8f0; font-weight:800;
                           border-top:2px solid #94a3b8; }
+    .sumtbl tbody tr { transition:filter .12s; }
+    .sumtbl tbody tr:hover { filter:brightness(.97); }
 
     details {
       background:linear-gradient(180deg,var(--card),var(--bg2));
       border:1px solid var(--line); border-radius:13px; margin-bottom:13px; overflow:hidden;
+      transition:border-color .2s, box-shadow .2s, background-color .45s ease;
+      animation:fadeUp .45s ease both;
     }
-    details[open] { box-shadow:0 18px 40px -26px rgba(0,0,0,.8); }
+    details:hover { border-color:var(--line2); }
+    details[open] { box-shadow:var(--card-shadow); }
     summary { cursor:pointer; padding:14px 18px; font-weight:700; list-style:none;
               display:flex; align-items:center; gap:10px; transition:background .12s; }
     summary::-webkit-details-marker { display:none; }
-    summary::before { content:"▸"; color:var(--muted); transition:transform .18s; font-size:12px; }
+    summary::before { content:"▸"; color:var(--muted); transition:transform .2s; font-size:12px; }
     details[open] summary::before { transform:rotate(90deg); }
-    summary:hover { background:rgba(255,255,255,.03); }
+    summary:hover { background:var(--hover-tint); }
     .count { margin-left:auto; color:var(--muted); font-weight:500; font-size:13px; }
     .scroll { max-height:440px; overflow:auto; padding:0 10px 10px; }
+    details[open] .scroll { animation:revealDown .3s ease both; }
     .badge { font-size:10.5px; padding:3px 10px; border-radius:99px; font-weight:800;
              letter-spacing:.5px; }
     .badge.int { background:rgba(14,116,144,.35); color:#67e8f9; border:1px solid #0e7490; }
     .badge.pos { background:rgba(147,51,234,.30); color:#e9d5ff; border:1px solid #9333ea; }
-    
-    .filter-badge { font-size:11px; color:var(--muted); background:var(--bg2);
-                    padding:4px 12px; border-radius:20px; border:1px solid var(--line2); }
+
+    .filter-badge { font-size:11px; color:var(--muted); background:var(--card2);
+                    padding:6px 14px; border-radius:20px; border:1px solid var(--line2);
+                    transition:background-color .3s, color .3s; }
+
+    /* ---------- Report tabs ---------- */
+    .tabbar { display:flex; flex-wrap:wrap; gap:8px; margin:4px 0 20px;
+              padding:6px; background:var(--card); border:1px solid var(--line);
+              border-radius:14px; box-shadow:var(--card-shadow); }
+    .tab { background:transparent; color:var(--muted); border:1px solid transparent;
+           border-radius:10px; padding:10px 16px; font-weight:700; font-size:13.5px;
+           cursor:pointer; display:inline-flex; align-items:center; gap:8px;
+           box-shadow:none; transition:background-color .18s, color .18s, transform .12s; }
+    .tab:hover { background:var(--hover-tint); color:var(--ink); transform:none; }
+    .tab.active { background:linear-gradient(135deg,var(--accent),var(--accent2));
+                  color:#051426; box-shadow:0 8px 20px -10px rgba(56,189,248,.7); }
+    .tab .tab-ico { font-size:15px; }
+    .tabcount { font-size:11px; font-weight:800; padding:2px 8px; border-radius:99px;
+                background:var(--card2); color:var(--muted); }
+    .tab.active .tabcount { background:rgba(5,20,38,.18); color:#051426; }
+    .report-panel { animation:fadeUp .35s ease both; }
+
+    /* ---------- Below-average flag ---------- */
+    .flag-yes { color:var(--red); font-weight:800; font-size:11px; letter-spacing:.4px; }
+    .flag-no  { color:var(--muted); font-weight:700; font-size:11px; letter-spacing:.4px; }
+    .avgcol { color:var(--accent2); font-weight:700; }
+
+    /* ---------- Allocation report ---------- */
+    .alloc-report .section-title { margin:0 0 14px; }
+    .alloc-note { color:var(--muted); font-weight:600; text-transform:none;
+                  letter-spacing:0; font-size:11px; }
+    .alloc-type { margin:18px 0 8px; }
+    .alloc-type:first-of-type { margin-top:4px; }
+    .alloc-sub { color:var(--muted); font-size:12px; font-weight:700;
+                 text-transform:uppercase; letter-spacing:.5px; margin:14px 2px 8px; }
+    .alloc-scroll { overflow-x:auto; border:1px solid var(--line); border-radius:12px; }
+    .alloc-tbl { border-collapse:collapse; width:100%; font-size:13px; min-width:520px; }
+    .alloc-tbl th, .alloc-tbl td { padding:9px 12px; border-bottom:1px solid var(--line);
+                                   text-align:right; white-space:nowrap;
+                                   font-variant-numeric:tabular-nums; }
+    .alloc-tbl th:first-child, .alloc-tbl td:first-child { text-align:left;
+                                   position:sticky; left:0; background:var(--card); font-weight:700; }
+    .alloc-tbl thead th { color:var(--muted); font-weight:700; background:var(--card2);
+                          font-size:11px; text-transform:uppercase; letter-spacing:.4px;
+                          border-bottom:1px solid var(--line2); }
+    .alloc-tbl thead th:first-child { background:var(--card2); }
+    .alloc-tbl tbody tr { transition:background .12s; }
+    .alloc-tbl tbody tr:hover { background:var(--row-hover); }
+    .alloc-tbl tbody tr:hover td:first-child { background:var(--card2); }
+    .alloc-tbl td.allcol { font-weight:800; border-left:1px solid var(--line2); }
+    .alloc-tbl th:last-child { border-left:1px solid var(--line2); }
+    .alloc-empty { text-align:center !important; color:var(--muted); font-style:italic; }
+
+    /* ---------- Animations ---------- */
+    @keyframes fadeUp { from { opacity:0; transform:translateY(14px); } to { opacity:1; transform:none; } }
+    @keyframes revealDown { from { opacity:0; transform:translateY(-6px); } to { opacity:1; transform:none; } }
+    @keyframes pop { from { opacity:0; transform:scale(.6) rotate(-8deg); } to { opacity:1; transform:none; } }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation:none !important; transition:none !important; }
+    }
   </style>
 </head>
 <body>
@@ -603,6 +785,9 @@ PAGE = """
     <div class="head">
       <div class="logo">📊</div>
       <h1>INT / POS Algo Calculator</h1>
+      <button type="button" class="theme-toggle" id="themeToggle" onclick="toggleTheme()" aria-label="Toggle color theme">
+        <span class="tt-icon" id="ttIcon">🌙</span><span id="ttLabel">Dark</span>
+      </button>
     </div>
     <p class="sub">Upload the data CSV, pick a date range, get the INT/POS split per algo plus a summary.</p>
 
@@ -631,7 +816,7 @@ PAGE = """
             <!-- User ID Filter -->
             <div class="filterbox">
               <div class="flabel">👤 User ID</div>
-              <input type="text" class="fsearch" placeholder="Search User IDs..." 
+              <input type="text" class="fsearch" placeholder="Search User IDs..."
                      oninput="filterList(this, 'user-list')">
               <div class="fselectall">
                 <label><input type="checkbox" onchange="toggleAll(this, 'user_ids')"> Select All Users</label>
@@ -644,7 +829,7 @@ PAGE = """
             <!-- Broker Filter -->
             <div class="filterbox">
               <div class="flabel">🏢 Broker</div>
-              <input type="text" class="fsearch" placeholder="Search Brokers..." 
+              <input type="text" class="fsearch" placeholder="Search Brokers..."
                      oninput="filterList(this, 'broker-list')">
               <div class="fselectall">
                 <label><input type="checkbox" onchange="toggleAll(this, 'brokers')"> Select All Brokers</label>
@@ -657,7 +842,7 @@ PAGE = """
             <!-- Algo Filter -->
             <div class="filterbox">
               <div class="flabel">📊 Algo</div>
-              <input type="text" class="fsearch" placeholder="Search Algos..." 
+              <input type="text" class="fsearch" placeholder="Search Algos..."
                      oninput="filterList(this, 'algo-list')">
               <div class="fselectall">
                 <label><input type="checkbox" onchange="toggleAll(this, 'algos')"> Select All Algos</label>
@@ -670,7 +855,7 @@ PAGE = """
             <!-- Server Filter -->
             <div class="filterbox">
               <div class="flabel">🖥️ Server</div>
-              <input type="text" class="fsearch" placeholder="Search Servers..." 
+              <input type="text" class="fsearch" placeholder="Search Servers..."
                      oninput="filterList(this, 'server-list')">
               <div class="fselectall">
                 <label><input type="checkbox" onchange="toggleAll(this, 'servers')"> Select All Servers</label>
@@ -680,6 +865,7 @@ PAGE = """
               </div>
             </div>
           </div>
+          <div class="filter-actions">
             <button type="submit" name="action" value="apply_filters" class="btn-apply">
               🔍 Apply Filters
             </button>
@@ -697,48 +883,88 @@ PAGE = """
 
     {% if error %}<div class="card err">⚠️ {{ error }}</div>{% endif %}
 
-    {% if summary_html %}
-      <div class="card">
-        <div class="bar">
-          <h2>Summary <span class="range">— {{ range_label }}</span></h2>
-          <a class="dl" href="/download/{{ token }}">⬇️ Download Excel (all sheets)</a>
-        </div>
-        {{ summary_html|safe }}
+    {% if reports %}
+      <div class="tabbar" role="tablist">
+        {% for rep in reports %}
+          <button type="button" class="tab {% if loop.first %}active{% endif %}"
+                  data-target="panel-{{ rep.key }}" onclick="showTab(this)">
+            <span class="tab-ico">{{ rep.icon }}</span>{{ rep.label }}
+            <span class="tabcount">{{ rep.count }}</span>
+          </button>
+        {% endfor %}
       </div>
 
-      <p class="section-title">Per algo / type</p>
-      {% for blk in blocks %}
-        <details>
-          <summary>Algo {{ blk.algo }}
-            <span class="badge {{ 'int' if blk.type=='INT' else 'pos' }}">{{ blk.type }}</span>
-            <span class="count">{{ blk.count }} accounts</span></summary>
-          <div class="scroll">{{ blk.html|safe }}</div>
-        </details>
+      {% for rep in reports %}
+      <div class="report-panel" id="panel-{{ rep.key }}" {% if not loop.first %}style="display:none"{% endif %}>
+        <div class="card">
+          <div class="bar">
+            <h2>{{ rep.label }} <span class="range">— {{ range_label }} · {{ rep.count }} accounts</span></h2>
+            <a class="dl" href="/download/{{ rep.token }}">⬇️ Download Excel (all sheets)</a>
+          </div>
+          {% if rep.summary_html %}{{ rep.summary_html|safe }}
+          {% else %}<p class="alloc-empty">No accounts in this view.</p>{% endif %}
+        </div>
+
+        {% if rep.alloc_report_html %}
+        <div class="card">
+          {{ rep.alloc_report_html|safe }}
+        </div>
+        {% endif %}
+
+        {% if rep.blocks %}
+        <p class="section-title">Per algo / type</p>
+        {% for blk in rep.blocks %}
+          <details>
+            <summary>Algo {{ blk.algo }}
+              <span class="badge {{ 'int' if blk.type=='INT' else 'pos' }}">{{ blk.type }}</span>
+              <span class="count">{{ blk.count }} accounts · avg {{ blk.avg }}</span></summary>
+            <div class="scroll">{{ blk.html|safe }}</div>
+          </details>
+        {% endfor %}
+        {% endif %}
+      </div>
       {% endfor %}
     {% endif %}
   </div>
 
   <script>
+    function applyThemeUI(theme) {
+      const icon = document.getElementById('ttIcon');
+      const label = document.getElementById('ttLabel');
+      if (theme === 'light') { icon.textContent = '☀️'; label.textContent = 'Light'; }
+      else { icon.textContent = '🌙'; label.textContent = 'Dark'; }
+    }
+
+    function toggleTheme() {
+      const cur = document.documentElement.getAttribute('data-theme') || 'dark';
+      const next = cur === 'dark' ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', next);
+      try { localStorage.setItem('theme', next); } catch (e) {}
+      applyThemeUI(next);
+    }
+
+    function showTab(btn) {
+      const target = btn.getAttribute('data-target');
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      btn.classList.add('active');
+      document.querySelectorAll('.report-panel').forEach(p => {
+        p.style.display = (p.id === target) ? '' : 'none';
+      });
+    }
+
     function filterList(input, listId) {
       const filter = input.value.toLowerCase();
       const list = document.getElementById(listId);
       const items = list.getElementsByClassName('fitem');
-      
       for (let item of items) {
         const text = item.textContent.toLowerCase();
-        if (text.includes(filter)) {
-          item.style.display = 'flex';
-        } else {
-          item.style.display = 'none';
-        }
+        item.style.display = text.includes(filter) ? 'flex' : 'none';
       }
     }
 
     function toggleAll(checkbox, name) {
       const checkboxes = document.querySelectorAll(`input[name="${name}"]`);
-      for (let cb of checkboxes) {
-        cb.checked = checkbox.checked;
-      }
+      for (let cb of checkboxes) { cb.checked = checkbox.checked; }
       updateFilterCount();
     }
 
@@ -747,29 +973,24 @@ PAGE = """
       const brokerChecks = document.querySelectorAll('input[name="brokers"]:checked');
       const algoChecks = document.querySelectorAll('input[name="algos"]:checked');
       const serverChecks = document.querySelectorAll('input[name="servers"]:checked');
-      const qsChecked = document.getElementById('qs_filter').checked;
-      
+      const qsEl = document.getElementById('qs_filter');
+      const qsChecked = qsEl ? qsEl.checked : false;
+
       let parts = [];
       if (userChecks.length > 0) parts.push(`👤 ${userChecks.length}`);
       if (brokerChecks.length > 0) parts.push(`🏢 ${brokerChecks.length}`);
       if (algoChecks.length > 0) parts.push(`📊 ${algoChecks.length}`);
       if (serverChecks.length > 0) parts.push(`🖥️ ${serverChecks.length}`);
       if (qsChecked) parts.push('⭐ QS');
-      
+
       const el = document.getElementById('filterCount');
-      if (parts.length > 0) {
-        el.textContent = 'Filters: ' + parts.join(' | ');
-      } else {
-        el.textContent = 'No filters applied';
-      }
+      el.textContent = parts.length > 0 ? 'Filters: ' + parts.join(' | ') : 'No filters applied';
     }
 
-    // Update filter count on any checkbox change
-    document.addEventListener('DOMContentLoaded', function() {
+    document.addEventListener('DOMContentLoaded', function () {
+      applyThemeUI(document.documentElement.getAttribute('data-theme') || 'dark');
       const checkboxes = document.querySelectorAll('input[type="checkbox"]');
-      for (let cb of checkboxes) {
-        cb.addEventListener('change', updateFilterCount);
-      }
+      for (let cb of checkboxes) { cb.addEventListener('change', updateFilterCount); }
       updateFilterCount();
     });
   </script>
@@ -793,7 +1014,23 @@ def _fmt_pct(x):
         return x
 
 
-def _table_html(df: pd.DataFrame, money_cols, pct_cols, total_label_col=None) -> str:
+def _fmt_avg_pct(x):
+    """Average-MTM% column: coloured accent value."""
+    try:
+        return f'<span class="avgcol">{x:.2f}%</span>'
+    except (ValueError, TypeError):
+        return x
+
+
+def _fmt_below_flag(x):
+    """Render the Below-Avg boolean as a coloured TRUE/FALSE flag."""
+    if x is True or (isinstance(x, str) and x.lower() == "true"):
+        return '<span class="flag-yes">TRUE</span>'
+    return '<span class="flag-no">FALSE</span>'
+
+
+def _table_html(df: pd.DataFrame, money_cols, pct_cols, total_label_col=None,
+                avg_cols=(), flag_cols=()) -> str:
     d = df.copy()
     for c in money_cols:
         if c in d.columns:
@@ -801,6 +1038,12 @@ def _table_html(df: pd.DataFrame, money_cols, pct_cols, total_label_col=None) ->
     for c in pct_cols:
         if c in d.columns:
             d[c] = d[c].map(_fmt_pct)
+    for c in avg_cols:
+        if c in d.columns:
+            d[c] = d[c].map(_fmt_avg_pct)
+    for c in flag_cols:
+        if c in d.columns:
+            d[c] = d[c].map(_fmt_below_flag)
     html = d.to_html(index=False, escape=False, border=0)
     if total_label_col:
         html = html.replace("<tr>\n      <td>TOTAL", '<tr class="total">\n      <td>TOTAL')
@@ -812,7 +1055,8 @@ def _render_summary(rollup: pd.DataFrame) -> str:
     if rollup.empty:
         return ""
     g = (rollup.groupby(["Algo", "Type"], as_index=False)
-         .agg(Accounts=("Alias", "count"), AUM=("AUM", "sum"), MTM=("Total MTM", "sum")))
+         .agg(Accounts=("Alias", "count"), AUM=("Weighted AUM", "sum"),
+              MTM=("Total MTM", "sum")))
     g = g.sort_values(["Algo", "Type"]).reset_index(drop=True)
 
     def money(x):
@@ -864,6 +1108,320 @@ def _render_summary(rollup: pd.DataFrame) -> str:
     return "".join(out)
 
 
+# ---------------------------------------------------------------------------
+# Allocation-bucket × MTM% analysis report
+# ---------------------------------------------------------------------------
+# A pivot: two sections (POS / INT) -> rows = Algo -> columns = allocation
+# bucket, each cell = AUM-weighted MTM% (sum of MTM / sum of AUM * 100) for the
+# accounts landing in that Algo + Type + bucket. AUM = allocation * 100, so
+# allocation 25k -> 25L ... 225k -> 2.25CR.  Algo 8 lives at crore-level
+# allocations, so instead of one column each it is split into ODD (3,5,7,9 CR)
+# vs EVEN (2,4,6,8 CR) crore buckets.
+
+ALGO8 = 8
+STD_STEP = 2_500_000                     # 25L step in AUM terms
+STD_MAX = 22_500_000                     # top of the fixed ladder = 2.25CR
+STD_BUCKETS = [                          # (label, AUM value)
+    ("25L", 2_500_000), ("50L", 5_000_000), ("75L", 7_500_000),
+    ("1CR", 10_000_000), ("1.25CR", 12_500_000), ("1.5CR", 15_000_000),
+    ("1.75CR", 17_500_000), ("2CR", 20_000_000), ("2.25CR", 22_500_000),
+]
+STD_BUCKET_VALUES = {v: l for l, v in STD_BUCKETS}
+OVERFLOW_LABEL = "≥2.5CR"
+ALGO8_ODD_LABEL = "ODD (3,5,7,9 CR)"
+ALGO8_EVEN_LABEL = "EVEN (2,4,6,8 CR)"
+
+
+def _std_bucket_label(aum: float) -> str:
+    """Map an account's AUM to the nearest 25L rung of the fixed ladder."""
+    rounded = int(round(aum / STD_STEP)) * STD_STEP
+    if rounded < STD_STEP:
+        rounded = STD_STEP
+    if rounded > STD_MAX:
+        return OVERFLOW_LABEL
+    return STD_BUCKET_VALUES[rounded]
+
+
+def _algo8_bucket_label(aum: float) -> str:
+    """Algo 8: nearest crore, then odd vs even crore grouping."""
+    cr = int(round(aum / 10_000_000))
+    if cr < 1:
+        cr = 1
+    return ALGO8_ODD_LABEL if cr % 2 == 1 else ALGO8_EVEN_LABEL
+
+
+def compute_alloc_report(rollup: pd.DataFrame):
+    """Aggregate MTM and AUM into (Type, Algo, bucket) cells for the report."""
+    if rollup is None or rollup.empty:
+        return None
+    r = rollup.dropna(subset=["AUM", "Weighted AUM", "Total MTM"]).copy()
+    if r.empty:
+        return None
+
+    types_order = [t for t in ("POS", "INT") if t in set(r["Type"])]
+    std = {}          # (type, algo) -> {label: [mtm_sum, aum_sum]}
+    algo8 = {}        # type -> {label: [mtm_sum, aum_sum]}
+    std_algos = set()
+    has_overflow = False
+
+    for _, row in r.iterrows():
+        typ, algo = row["Type"], row["Algo"]
+        # Bucket by the nominal allocation the client is on; total the
+        # de-duplicated share so a multi-algo client is not counted twice.
+        aum, mtm = float(row["AUM"]), float(row["Total MTM"])
+        w_aum = float(row["Weighted AUM"])
+        if algo == ALGO8:
+            lbl = _algo8_bucket_label(aum)
+            bucket = algo8.setdefault(typ, {})
+        else:
+            lbl = _std_bucket_label(aum)
+            if lbl == OVERFLOW_LABEL:
+                has_overflow = True
+            std_algos.add(algo)
+            bucket = std.setdefault((typ, algo), {})
+        cell = bucket.setdefault(lbl, [0.0, 0.0])
+        cell[0] += mtm
+        cell[1] += w_aum
+
+    std_labels = [l for l, _ in STD_BUCKETS] + ([OVERFLOW_LABEL] if has_overflow else [])
+    return {
+        "types": types_order,
+        "std_labels": std_labels,
+        "std_algos": sorted(std_algos),
+        "std": std,
+        "algo8": algo8,
+    }
+
+
+def _wpct_cell(mtm: float, aum: float) -> str:
+    """AUM-weighted MTM% as a coloured HTML cell (blank when no AUM)."""
+    if not aum:
+        return ""
+    v = mtm / aum * 100
+    cls = "neg" if v < 0 else "pos"
+    return f'<span class="{cls}">{v:.2f}%</span>'
+
+
+def _alloc_report_html(rep) -> str:
+    """Render the allocation-bucket pivot as themed HTML tables."""
+    if not rep:
+        return ""
+    std_labels = rep["std_labels"]
+    out = ['<div class="alloc-report">']
+    out.append('<p class="section-title">Allocation × MTM% analysis '
+               '<span class="alloc-note">— AUM-weighted MTM% per allocation bucket</span></p>')
+
+    for typ in rep["types"]:
+        badge = "int" if typ == "INT" else "pos"
+        out.append(f'<div class="alloc-type"><span class="badge {badge}">{typ}</span></div>')
+
+        # Standard ladder table (all algos except 8).
+        out.append('<div class="alloc-scroll"><table class="alloc-tbl"><thead><tr>'
+                   '<th>Algo</th>')
+        for lbl in std_labels:
+            out.append(f"<th>{html_lib.escape(lbl)}</th>")
+        out.append('<th>All</th></tr></thead><tbody>')
+
+        any_std = False
+        for algo in rep["std_algos"]:
+            cell = rep["std"].get((typ, algo))
+            if not cell:
+                continue
+            any_std = True
+            out.append(f"<tr><td>Algo {html_lib.escape(str(algo))}</td>")
+            tm = ta = 0.0
+            for lbl in std_labels:
+                pair = cell.get(lbl)
+                if pair:
+                    out.append(f"<td>{_wpct_cell(pair[0], pair[1])}</td>")
+                    tm += pair[0]
+                    ta += pair[1]
+                else:
+                    out.append("<td></td>")
+            out.append(f'<td class="allcol">{_wpct_cell(tm, ta)}</td></tr>')
+        if not any_std:
+            out.append(f'<tr><td colspan="{len(std_labels) + 2}" '
+                       f'class="alloc-empty">No standard-ladder accounts</td></tr>')
+        out.append("</tbody></table></div>")
+
+        # Algo 8 crore-split table.
+        a8 = rep["algo8"].get(typ)
+        if a8:
+            odd = a8.get(ALGO8_ODD_LABEL)
+            even = a8.get(ALGO8_EVEN_LABEL)
+            om, oa = (odd[0], odd[1]) if odd else (0.0, 0.0)
+            em, ea = (even[0], even[1]) if even else (0.0, 0.0)
+            out.append('<div class="alloc-sub">Algo 8 — crore split</div>')
+            out.append('<div class="alloc-scroll"><table class="alloc-tbl"><thead><tr>'
+                       '<th>Algo</th>'
+                       '<th>ODD ALLOCATION<br><span class="alloc-note">3, 5, 7, 9 CR</span></th>'
+                       '<th>EVEN ALLOCATION<br><span class="alloc-note">2, 4, 6, 8 CR</span></th>'
+                       '<th>All</th></tr></thead><tbody><tr><td>Algo 8</td>')
+            out.append(f"<td>{_wpct_cell(om, oa) if odd else ''}</td>")
+            out.append(f"<td>{_wpct_cell(em, ea) if even else ''}</td>")
+            out.append(f'<td class="allcol">{_wpct_cell(om + em, oa + ea)}</td>')
+            out.append('</tr></tbody></table></div>')
+
+    out.append("</div>")
+    return "".join(out)
+
+
+def _put_pct(ws, row, col, mtm, aum):
+    """Write an AUM-weighted MTM% value into an Excel cell with sign colour."""
+    if not aum:
+        return
+    v = mtm / aum * 100
+    cell = ws.cell(row, col, v)
+    cell.number_format = PCT_FMT
+    cell.font = RED_FONT if v < 0 else GREEN_FONT
+
+
+def _alloc_header_row(ws, row, ncols):
+    for c in range(1, ncols + 1):
+        cell = ws.cell(row, c)
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = CENTER
+
+
+def write_alloc_sheet(ws, rep):
+    """Write the allocation-bucket pivot onto an Excel worksheet (computed values)."""
+    title = ws.cell(1, 1, "Allocation × MTM% Analysis  —  AUM-weighted MTM% per allocation bucket")
+    title.font = Font(bold=True, size=12)
+    if not rep:
+        ws.cell(3, 1, "No data.")
+        return
+
+    std_labels = rep["std_labels"]
+    ncols = len(std_labels) + 2  # Algo + buckets + All
+    row = 3
+    for typ in rep["types"]:
+        tcell = ws.cell(row, 1, typ)
+        tcell.font = Font(bold=True, color="FFFFFF")
+        band = PatternFill("solid", fgColor=("6D28D9" if typ == "POS" else "0E7490"))
+        for c in range(1, ncols + 1):
+            ws.cell(row, c).fill = band
+        ws.cell(row, 1).font = Font(bold=True, color="FFFFFF")
+        row += 1
+
+        headers = ["Algo"] + std_labels + ["All"]
+        for c, h in enumerate(headers, 1):
+            ws.cell(row, c, h)
+        _alloc_header_row(ws, row, len(headers))
+        row += 1
+
+        for algo in rep["std_algos"]:
+            cell = rep["std"].get((typ, algo))
+            if not cell:
+                continue
+            ws.cell(row, 1, f"Algo {algo}")
+            tm = ta = 0.0
+            for i, lbl in enumerate(std_labels):
+                pair = cell.get(lbl)
+                if pair:
+                    _put_pct(ws, row, 2 + i, pair[0], pair[1])
+                    tm += pair[0]
+                    ta += pair[1]
+            _put_pct(ws, row, 2 + len(std_labels), tm, ta)
+            ws.cell(row, 2 + len(std_labels)).font = TOTAL_FONT
+            row += 1
+
+        a8 = rep["algo8"].get(typ)
+        if a8:
+            ws.cell(row, 1, "Algo 8 — crore split").font = TOTAL_FONT
+            row += 1
+            for c, h in enumerate(["Algo", ALGO8_ODD_LABEL, ALGO8_EVEN_LABEL, "All"], 1):
+                ws.cell(row, c, h)
+            _alloc_header_row(ws, row, 4)
+            row += 1
+            odd = a8.get(ALGO8_ODD_LABEL)
+            even = a8.get(ALGO8_EVEN_LABEL)
+            om, oa = (odd[0], odd[1]) if odd else (0.0, 0.0)
+            em, ea = (even[0], even[1]) if even else (0.0, 0.0)
+            ws.cell(row, 1, "Algo 8")
+            if odd:
+                _put_pct(ws, row, 2, om, oa)
+            if even:
+                _put_pct(ws, row, 3, em, ea)
+            _put_pct(ws, row, 4, om + em, oa + ea)
+            ws.cell(row, 4).font = TOTAL_FONT
+            row += 1
+
+        row += 1  # blank spacer between sections
+
+    ws.column_dimensions["A"].width = 18
+    for c in range(2, ncols + 1):
+        ws.column_dimensions[get_column_letter(c)].width = 11
+
+
+# ---------------------------------------------------------------------------
+# Scoped reports (Overall / 1.25CR+ / Below 1.25CR) + per-account detail blocks
+# ---------------------------------------------------------------------------
+
+THRESH_125CR = 12_500_000  # AUM = allocation * 100, so 1.25CR = 12,500,000
+
+# Columns shown in each per-algo/type detail table, including the two new
+# analysis columns: the peer-group average MTM% and the below-average flag.
+DETAIL_COLS = ["Alias", "UserID", "AUM", "Weighted AUM", "Total MTM", "MTM%",
+               "Avg MTM%", "Below Avg", "Trading Days", "Broker", "Server"]
+
+
+def _scope_rollups(rollup: pd.DataFrame):
+    """Yield (key, label, icon, scoped_rollup) for the three report views."""
+    if rollup is None or rollup.empty:
+        empty = rollup if rollup is not None else pd.DataFrame()
+        return [
+            ("overall", "Overall", "🌐", empty),
+            ("ge125cr", "1.25CR & above", "💎", empty),
+            ("lt125cr", "Below 1.25CR", "🔹", empty),
+        ]
+    aum = rollup["AUM"]
+    return [
+        ("overall", "Overall", "🌐", rollup),
+        ("ge125cr", "1.25CR & above", "💎", rollup[aum >= THRESH_125CR]),
+        ("lt125cr", "Below 1.25CR", "🔹", rollup[aum < THRESH_125CR]),
+    ]
+
+
+def _scope_raw(df_range: pd.DataFrame, scoped_rollup: pd.DataFrame) -> pd.DataFrame:
+    """Slice raw rows down to the accounts present in a scoped rollup."""
+    if scoped_rollup is None or scoped_rollup.empty:
+        return df_range.iloc[0:0]
+    ids = set(zip(scoped_rollup["Algo"].tolist(), scoped_rollup["UserID"].tolist()))
+    pairs = zip(df_range["algo"].tolist(), df_range["user_id"].tolist())
+    mask = [p in ids for p in pairs]
+    return df_range.loc[mask]
+
+
+def build_detail_blocks(rollup: pd.DataFrame) -> list:
+    """Per-algo/type detail tables with aggregate MTM% + below-average flag.
+
+    'Avg MTM%' is the AUM-weighted MTM% of that same algo/type block
+    (total MTM / total AUM * 100, i.e. the block's TOTAL-row MTM%), repeated on
+    every row; 'Below Avg' is TRUE when the row's MTM% is below that value.
+    """
+    blocks = []
+    if rollup is None or rollup.empty:
+        return blocks
+    for (algo, acct_type), g in rollup.groupby(["Algo", "Type"], sort=True):
+        g = g.copy()
+        tot_aum = g["Weighted AUM"].sum()
+        tot_mtm = g["Total MTM"].sum()
+        avg = (tot_mtm / tot_aum * 100) if tot_aum else float("nan")
+        g["Avg MTM%"] = avg
+        g["Below Avg"] = g["MTM%"] < avg  # NaN compares False
+        cols = [c for c in DETAIL_COLS if c in g.columns]
+        html = _table_html(
+            g[cols], ["AUM", "Weighted AUM", "Total MTM"], ["MTM%"],
+            avg_cols=["Avg MTM%"], flag_cols=["Below Avg"])
+        blocks.append({
+            "algo": algo, "type": acct_type, "count": len(g),
+            "avg": f"{avg:.2f}%" if pd.notna(avg) else "—",
+            "html": html,
+        })
+    return blocks
+
+
 def _get_filtered_df(df: pd.DataFrame, form_data) -> tuple[pd.DataFrame, str, dict]:
     """Apply filters to the dataframe based on form data."""
     filtered_df = df.copy()
@@ -898,19 +1456,15 @@ def _get_filtered_df(df: pd.DataFrame, form_data) -> tuple[pd.DataFrame, str, di
         filter_summary_parts.append(f"🖥️ {len(servers)} servers")
         filter_state['servers'] = servers
 
-    if qs_filter:
-        # Filter for aliases containing "QS"
-        filtered_df = filtered_df[filtered_df['alias'].astype(str).str.contains('QS', case=False, na=False)]
-        filter_summary_parts.append("⭐ QS")
-        filter_state['qs_filter'] = True
-
     filter_summary = " | ".join(filter_summary_parts) if filter_summary_parts else "No filters applied"
     
     return filtered_df, filter_summary, filter_state
 
 
 _PAGE_DEFAULTS = dict(
-    summary_html=None, error=None, notice=None, blocks=[], token=None, range_label="",
+    reports=[],
+    summary_html=None, alloc_report_html=None,
+    error=None, notice=None, blocks=[], token=None, range_label="",
     date_from="", date_to="", data_token="", data_name="",
     users_html="", brokers_html="", servers_html="", algos_html="",
     filter_summary="No filters applied", qs_filter=False,
@@ -1074,25 +1628,27 @@ def process():
 
     rollup = build_account_rollup(df_range)
 
-    # Per algo/type blocks
-    blocks = []
-    detail_cols = ["Alias", "UserID", "AUM", "Total MTM", "MTM%", "Trading Days", "Broker", "Server"]
-    for (algo, acct_type), g in rollup.groupby(["Algo", "Type"], sort=True):
-        blocks.append({
-            "algo": algo, "type": acct_type, "count": len(g),
-            "html": _table_html(g[detail_cols], ["AUM", "Total MTM"], ["MTM%"]),
+    # Build three scoped reports: Overall, 1.25CR & above, Below 1.25CR.
+    reports = []
+    for key, label, icon, rl in _scope_rollups(rollup):
+        raw_scope = _scope_raw(df_range, rl)
+        token = uuid.uuid4().hex
+        _EXCEL_CACHE[token] = (
+            f"int_pos_{key}_{d_from}_{d_to}.xlsx", build_excel(rl, raw_scope))
+        reports.append({
+            "key": key, "label": label, "icon": icon, "count": len(rl),
+            "token": token,
+            "summary_html": _render_summary(rl) if not rl.empty else "",
+            "alloc_report_html": _alloc_report_html(compute_alloc_report(rl)),
+            "blocks": build_detail_blocks(rl),
         })
 
-    summary_html = _render_summary(rollup)
-
-    token = uuid.uuid4().hex
-    _EXCEL_CACHE[token] = (f"int_pos_{d_from}_{d_to}.xlsx", build_excel(rollup, df_range))
-    if len(_EXCEL_CACHE) > 20:
-        for k in list(_EXCEL_CACHE)[:-20]:
+    if len(_EXCEL_CACHE) > 30:
+        for k in list(_EXCEL_CACHE)[:-30]:
             _EXCEL_CACHE.pop(k, None)
 
     return _page(
-        summary_html=summary_html, blocks=blocks, token=token,
+        reports=reports,
         range_label=f"{d_from} to {d_to}",
         date_from=df_from, date_to=df_to,
         users_html=users_html, brokers_html=brokers_html,

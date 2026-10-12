@@ -63,6 +63,105 @@ def classify_type(dte_series: pd.Series) -> str:
     return "INT"
 
 
+def uid_key(value) -> str:
+    """Canonical string form of a user id so CSV and Excel ids compare equal."""
+    s = str(value).strip()
+    if s.endswith(".0"):
+        s = s[:-2]
+    return normalize_target_user_id(s)
+
+
+def load_positional_file(file_bytes: bytes) -> dict[str, set]:
+    """Read the 'Positional Algos Data' workbook -> {user_id: {dates it ran positional}}.
+
+    Every sheet is a month; the first column is the settlement date (its header
+    differs between months) and a 'UserID' column lists the accounts that ran
+    positional that day.
+    """
+    sheets = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None)
+    pos: dict[str, set] = {}
+    for df in sheets.values():
+        df.columns = [str(c).strip() for c in df.columns]
+        uid_col = next((c for c in df.columns if c.lower() == "userid"), None)
+        if uid_col is None or df.empty:
+            continue
+        dates = pd.to_datetime(df.iloc[:, 0], errors="coerce")
+        for d, u in zip(dates, df[uid_col]):
+            if pd.notna(d) and pd.notna(u):
+                pos.setdefault(uid_key(u), set()).add(d.date())
+    if not pos:
+        raise ValueError("no UserID / date rows found in the positional file")
+    return pos
+
+
+def apply_final_allocation(df: pd.DataFrame, pos_map: dict | None) -> tuple[pd.DataFrame, dict]:
+    """Group rows into positional cycles, re-denominate them at the 0DTE allocation.
+
+    A cycle is one user + algo + expiry: NF runs 4DTE -> 1DTE -> 0DTE, SX runs
+    1DTE -> 0DTE.  A leg's expiry is ``date + DTE`` (Fri 4DTE and Mon 1DTE both land
+    on Tuesday; Wed 1DTE lands on Thursday), so NF and SX cycles never mix, even for
+    a user stopped out before 0DTE.  A cycle is positional when the positional file
+    lists the user on any of its dates; everyone else keeps their allocation.
+
+    Adds two columns:
+      * ``cycle``     -- "ddmmyy-ddmmyy" (first leg date - expiry), e.g. 300926-011026
+      * ``pos_cycle`` -- True on every row of a positional cycle, including a 0DTE
+                         row that falls in the next month, so it stays POS.
+
+    The cycle's final allocation is the one on its 0DTE row.  When the user never
+    reached 0DTE (e.g. the 1DTE leg hit its stop-loss) the last leg's allocation is
+    used, so the user is still counted.  Returns (new df, stats).
+    """
+    stats = {"cycles": 0, "no_zero_dte": 0, "rows_changed": 0}
+    if not pos_map or df.empty:
+        return df, stats
+
+    day = df["date"].dt.normalize()
+    stage = df["dte"].map(lambda v: min(dte_numbers(v), default=None))
+    work = pd.DataFrame({
+        "algo": df["algo"],
+        "uid": df["user_id"].map(uid_key),
+        "exp": day + pd.to_timedelta(stage.fillna(-1e6), unit="D"),
+        "date": day,
+        "is0": stage == 0,
+        "alloc": df["allocation"],
+    }, index=df.index)
+    work["pos"] = [pd.notna(d) and d.date() in pos_map.get(u, ())
+                   for d, u in zip(work["date"], work["uid"])]
+    work = work[stage.notna() & day.notna()]
+
+    keys = ["algo", "uid", "exp"]
+    grp = work.groupby(keys)
+    work["pos_cycle"] = grp["pos"].transform("any").fillna(False).astype(bool)
+    start = grp["date"].transform("min")
+
+    out = df.copy()
+    out["cycle"] = None
+    out["pos_cycle"] = False
+    out.loc[work.index, "cycle"] = (start.dt.strftime("%d%m%y") + "-"
+                                    + work["exp"].dt.strftime("%d%m%y"))
+    out.loc[work.index, "pos_cycle"] = work["pos_cycle"]
+
+    work = work[work["pos_cycle"]]
+    if work.empty:
+        return out, stats
+
+    # Sorted so the last positive allocation of a cycle is its 0DTE one, else its latest leg.
+    cand = work[work["alloc"] > 0].sort_values(["is0", "date"], kind="stable")
+    final = cand.groupby(keys)["alloc"].last()
+    new = final.reindex(pd.MultiIndex.from_frame(work[keys])).to_numpy()
+    ok = pd.notna(new)
+
+    out["allocation"] = out["allocation"].astype(float)
+    changed = out.loc[work.index[ok], "allocation"].to_numpy() != new[ok]
+    out.loc[work.index[ok], "allocation"] = new[ok]
+
+    stats["cycles"] = len(final)
+    stats["no_zero_dte"] = int((~cand.groupby(keys)["is0"].any()).sum())
+    stats["rows_changed"] = int(changed.sum())
+    return out, stats
+
+
 def load_csv(file_bytes: bytes) -> pd.DataFrame:
     try:
         df = pd.read_csv(io.BytesIO(file_bytes), encoding="utf-8-sig")
@@ -79,8 +178,13 @@ def load_csv(file_bytes: bytes) -> pd.DataFrame:
     return df
 
 
-def build_account_rollup(df: pd.DataFrame) -> pd.DataFrame:
-    """One row per (algo, user_id): classification + aggregated numbers."""
+def build_account_rollup(df: pd.DataFrame, pos_map: dict | None = None) -> pd.DataFrame:
+    """One row per (algo, user_id): classification + aggregated numbers.
+
+    With ``pos_map`` (from load_positional_file) an account is POS when its user
+    id appears in the positional file on any date it traded in ``df``; otherwise
+    INT.  Without it, the DTE-based classify_type rule is used.
+    """
     rows = []
     df_sorted = df.sort_values("date")
     # A client running several algos still deploys ONE pot of capital, so the
@@ -93,7 +197,16 @@ def build_account_rollup(df: pd.DataFrame) -> pd.DataFrame:
     user_days = (df_sorted.dropna(subset=["date"])
                  .groupby("user_id")["date"].nunique().to_dict())
     for (algo, uid), g in df_sorted.groupby(["algo", "user_id"], sort=False):
-        acct_type = classify_type(g["dte"])
+        if pos_map is None:
+            acct_type = classify_type(g["dte"])
+        else:
+            pos_dates = pos_map.get(uid_key(uid), set())
+            # A 0DTE row that spills into the next month still belongs to a
+            # positional cycle (pos_cycle, from apply_final_allocation).
+            in_pos_cycle = "pos_cycle" in g.columns and g["pos_cycle"].any()
+            acct_type = ("POS" if in_pos_cycle
+                         or not pos_dates.isdisjoint(g["date"].dropna().dt.date)
+                         else "INT")
         last = g.iloc[-1]
         aum = g["allocation"].mean() * 100
         days = int(user_days.get(uid, 0)) or len(g)
@@ -233,7 +346,8 @@ def _add_sign_colors(ws, ranges):
             rng, CellIsRule(operator="greaterThan", formula=["0"], font=GREEN_FONT))
 
 
-def build_excel(rollup: pd.DataFrame, raw: pd.DataFrame) -> bytes:
+def build_excel(rollup: pd.DataFrame, raw: pd.DataFrame,
+                pos_map: dict | None = None) -> bytes:
     """Build the workbook with every figure as a live Excel formula."""
     buf = io.BytesIO()
     wb = Workbook()
@@ -241,23 +355,24 @@ def build_excel(rollup: pd.DataFrame, raw: pd.DataFrame) -> bytes:
     ws_sum.title = "Summary"
 
     ws_data = wb.create_sheet("Data")
-    ws_data.append(["Date", "Algo", "Alias", "UserID", "Allocation", "MTM_all", "DTE"])
+    ws_data.append(["Date", "Algo", "Alias", "UserID", "Allocation", "MTM_all", "DTE", "Cycle"])
     sub = raw.reindex(columns=["date", "algo", "alias", "user_id", "allocation",
-                               "mtm_all", "dte"])
+                               "mtm_all", "dte", "cycle"])
     for row in sub.itertuples(index=False):
         d = row.date
         d = d.to_pydatetime() if pd.notna(d) else None
         ws_data.append([d, _cell_val(row.algo), _cell_val(row.alias), _cell_val(row.user_id),
                         _cell_val(row.allocation), _cell_val(row.mtm_all),
-                        _cell_val(row.dte)])
+                        _cell_val(row.dte), _cell_val(row.cycle)])
     data_last = len(sub) + 1
     for r in range(2, data_last + 1):
         ws_data.cell(r, 1).number_format = "yyyy-mm-dd"
         ws_data.cell(r, 5).number_format = MONEY_FMT
         ws_data.cell(r, 6).number_format = MONEY_FMT
         ws_data.cell(r, 7).alignment = CENTER
-    _style_header(ws_data, 7)
-    for col, w in zip("ABCDEFG", (13, 10, 22, 12, 16, 16, 14)):
+        ws_data.cell(r, 8).alignment = CENTER
+    _style_header(ws_data, 8)
+    for col, w in zip("ABCDEFGH", (13, 10, 22, 12, 16, 16, 14, 16)):
         ws_data.column_dimensions[col].width = w
 
     algo_rng = f"Data!$B$2:$B${data_last}"
@@ -420,6 +535,11 @@ def build_excel(rollup: pd.DataFrame, raw: pd.DataFrame) -> bytes:
     write_alloc_sheet(ws_alloc, compute_alloc_report(rollup))
     wb.move_sheet(ws_alloc, offset=1 - wb.sheetnames.index("Allocation Report"))
 
+    # Month-to-month INT / POS table (placed right after Summary).
+    ws_month = wb.create_sheet("Month Summary")
+    write_month_sheet(ws_month, build_month_summary(raw, pos_map))
+    wb.move_sheet(ws_month, offset=1 - wb.sheetnames.index("Month Summary"))
+
     wb.move_sheet(ws_users, offset=len(wb.sheetnames) - 1 - wb.sheetnames.index("Users"))
     wb.move_sheet(ws_data, offset=len(wb.sheetnames) - 1 - wb.sheetnames.index("Data"))
     wb.active = 0
@@ -438,6 +558,7 @@ app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024
 _EXCEL_CACHE: dict[str, tuple[str, bytes]] = {}
 _DATA_CACHE: dict[str, tuple[str, bytes]] = {}
 _FILTER_CACHE: dict[str, tuple[pd.DataFrame, dict]] = {}  # token -> (df, filter_state)
+_POS_CACHE: dict[str, tuple[str, dict]] = {}  # token -> (file name, {user_id: {dates}})
 
 
 def _skey(x) -> str:
@@ -799,6 +920,12 @@ PAGE = """
           {% if data_name %}<div class="fileinfo">📎 Loaded: <b>{{ data_name }}</b> — choose a new file only to replace it.</div>{% endif %}
         </div>
         <div class="field">
+          <label>Positional Algos file (optional)</label>
+          <input type="file" name="pos_file" accept=".xlsx,.xlsm">
+          {% if pos_name %}<div class="fileinfo">📎 Loaded: <b>{{ pos_name }}</b> — accounts in it are POS, the rest INT; every 4DTE/1DTE leg is calculated on its cycle's 0DTE allocation.</div>
+          {% else %}<div class="fhint">Without it, POS/INT is decided from the DTE column.</div>{% endif %}
+        </div>
+        <div class="field">
           <label>Date from (optional)</label>
           <input type="date" name="date_from" value="{{ date_from or '' }}">
         </div>
@@ -809,6 +936,7 @@ PAGE = """
         <button type="submit" name="action" value="upload" class="btn-upload">⬆️ Upload &amp; load filters</button>
 
         <input type="hidden" name="data_token" id="data_token" value="{{ data_token }}">
+        <input type="hidden" name="pos_token" id="pos_token" value="{{ pos_token }}">
 
         <!-- Filters Section -->
         <div class="filters">
@@ -904,6 +1032,12 @@ PAGE = """
           {% if rep.summary_html %}{{ rep.summary_html|safe }}
           {% else %}<p class="alloc-empty">No accounts in this view.</p>{% endif %}
         </div>
+
+        {% if rep.month_html %}
+        <div class="card">
+          {{ rep.month_html|safe }}
+        </div>
+        {% endif %}
 
         {% if rep.alloc_report_html %}
         <div class="card">
@@ -1393,6 +1527,160 @@ def _scope_raw(df_range: pd.DataFrame, scoped_rollup: pd.DataFrame) -> pd.DataFr
     return df_range.loc[mask]
 
 
+# ---------------------------------------------------------------------------
+# Month-to-month INT / POS summary
+# ---------------------------------------------------------------------------
+
+def _split_types(ru: pd.DataFrame) -> dict:
+    """{'INT': (accounts, AUM, MTM), 'POS': (...)} for a rollup slice."""
+    out = {}
+    for t in ("INT", "POS"):
+        s = ru[ru["Type"] == t]
+        out[t] = (len(s), float(s["Weighted AUM"].sum()), float(s["Total MTM"].sum()))
+    return out
+
+
+def _algo_sort_key(a):
+    try:
+        return (0, float(a), "")
+    except (TypeError, ValueError):
+        return (1, 0.0, str(a))
+
+
+def build_month_summary(raw: pd.DataFrame, pos_map: dict | None = None) -> list:
+    """One entry per calendar month: INT/POS (accounts, AUM, MTM) overall and per algo.
+
+    Each month is classified on its own (an account can be INT in one month and
+    POS in the next), and AUM is the de-duplicated Weighted AUM of that month.
+    """
+    if raw is None or raw.empty:
+        return []
+    d = raw.dropna(subset=["date"])
+    out = []
+    for period, g in d.groupby(d["date"].dt.to_period("M")):
+        ru = build_account_rollup(g, pos_map)
+        algos = sorted(ru["Algo"].unique(), key=_algo_sort_key)
+        out.append({
+            "month": period.strftime("%b-%y"),
+            **_split_types(ru),
+            "algos": [(_skey(a), _split_types(ru[ru["Algo"] == a])) for a in algos],
+        })
+    return out
+
+
+def _combined(entry) -> tuple:
+    """(accounts, AUM, MTM) for INT + POS combined."""
+    return tuple(a + b for a, b in zip(entry["INT"], entry["POS"]))
+
+
+def _month_lines(rows: list):
+    """Yield (month, algo_label, entry, is_month_total, month_index) display lines."""
+    for i, e in enumerate(rows):
+        for algo, split in e["algos"]:
+            yield e["month"], f"Algo {algo}", split, False, i
+        yield e["month"], "Total", e, True, i
+
+
+def _month_summary_html(rows: list) -> str:
+    """Month-wise, algo-wise INT / POS / Total table."""
+    if not rows:
+        return ""
+
+    def signed(x):
+        col = "#c0392b" if x < 0 else "#178f52"
+        return f'<span style="color:{col};font-weight:600">{x:,.0f}</span>'
+
+    def pct(aum, mtm):
+        if not aum:
+            return ""
+        v = mtm / aum * 100
+        col = "#c0392b" if v < 0 else "#178f52"
+        return f'<span style="color:{col};font-weight:600">{v:.2f}%</span>'
+
+    def cells(t):
+        acc, aum, mtm = t
+        return (f"<td>{int(acc):,}</td><td>{aum:,.0f}</td>"
+                f"<td>{signed(mtm)}</td><td>{pct(aum, mtm)}</td>")
+
+    out = ["<p class='section-title'>Month-to-month, algo-wise INT / POS "
+           "<span class='alloc-note'>— each month classified on its own</span></p>",
+           "<div class='sumwrap'><table class='sumtbl'><thead>"
+           "<tr><th rowspan='2'>Month</th><th rowspan='2'>Algo</th>"
+           "<th colspan='4'>INT</th><th colspan='4'>POS</th><th colspan='4'>TOTAL</th></tr><tr>"
+           + "<th>Accounts</th><th>AUM</th><th>MTM</th><th>MTM%</th>" * 3
+           + "</tr></thead><tbody>"]
+    for month, label, e, is_total, i in _month_lines(rows):
+        light, mid = ALGO_BANDS_WEB[i % len(ALGO_BANDS_WEB)]
+        style = f"background:{mid};font-weight:700" if is_total else f"background:{light}"
+        out.append(f"<tr style='{style}'><td>{month}</td><td>{label}</td>"
+                   f"{cells(e['INT'])}{cells(e['POS'])}{cells(_combined(e))}</tr>")
+    # AUM is a per-month average capital, so only MTM is summed across months.
+    tot = [sum(e[t][2] for e in rows) for t in ("INT", "POS")]
+    blank = "<td></td><td></td>"
+    out.append(f"<tr class='grand'><td colspan='2'>TOTAL</td>{blank}<td>{signed(tot[0])}</td><td></td>"
+               f"{blank}<td>{signed(tot[1])}</td><td></td>"
+               f"{blank}<td>{signed(tot[0] + tot[1])}</td><td></td></tr>")
+    out.append("</tbody></table></div>")
+    return "".join(out)
+
+
+def write_month_sheet(ws, rows: list) -> None:
+    """Write the month-wise, algo-wise INT / POS / Total table onto an Excel worksheet."""
+    if not rows:
+        ws.cell(1, 1, "No data.")
+        return
+    ncols = 14
+    for c, name in ((1, "Month"), (2, "Algo")):
+        ws.cell(1, c, name)
+        ws.merge_cells(start_row=1, start_column=c, end_row=2, end_column=c)
+    for gi, name in enumerate(("INT", "POS", "TOTAL")):
+        c0 = 3 + gi * 4
+        ws.cell(1, c0, name)
+        ws.merge_cells(start_row=1, start_column=c0, end_row=1, end_column=c0 + 3)
+        for j, h in enumerate(("Accounts", "AUM", "MTM", "MTM%")):
+            ws.cell(2, c0 + j, h)
+    for r in (1, 2):
+        for c in range(1, ncols + 1):
+            cell = ws.cell(r, c)
+            cell.fill, cell.font, cell.alignment = HEADER_FILL, HEADER_FONT, CENTER
+    ws.freeze_panes = "C3"
+
+    r = 3
+    for month, label, e, is_total, i in _month_lines(rows):
+        light, mid = ALGO_BANDS_XL[i % len(ALGO_BANDS_XL)]
+        fill = PatternFill("solid", fgColor=mid if is_total else light)
+        ws.cell(r, 1, month)
+        ws.cell(r, 2, label)
+        for gi, t in enumerate((e["INT"], e["POS"], _combined(e))):
+            acc, aum, mtm = t
+            c0 = 3 + gi * 4
+            ws.cell(r, c0, acc).number_format = "#,##0"
+            ws.cell(r, c0 + 1, aum).number_format = MONEY_FMT
+            ws.cell(r, c0 + 2, mtm).number_format = MONEY_FMT
+            if aum:
+                ws.cell(r, c0 + 3, mtm / aum * 100).number_format = PCT_FMT
+        for c in range(1, ncols + 1):
+            ws.cell(r, c).fill = fill
+            if is_total:
+                ws.cell(r, c).font = TOTAL_FONT
+        r += 1
+
+    ws.cell(r, 1, "TOTAL")
+    ints, poss = (sum(e[t][2] for e in rows) for t in ("INT", "POS"))
+    for col, v in ((5, ints), (9, poss), (13, ints + poss)):
+        ws.cell(r, col, v).number_format = MONEY_FMT
+    for c in range(1, ncols + 1):
+        ws.cell(r, c).font = TOTAL_FONT
+        ws.cell(r, c).border = TOTAL_TOP
+        ws.cell(r, c).fill = GRAND_FILL
+    _add_sign_colors(ws, [f"{get_column_letter(c)}3:{get_column_letter(c)}{r}"
+                          for c in (5, 6, 9, 10, 13, 14)])
+    ws.column_dimensions["A"].width = 12
+    ws.column_dimensions["B"].width = 10
+    for c in range(3, ncols + 1):
+        ws.column_dimensions[get_column_letter(c)].width = 13
+
+
 def build_detail_blocks(rollup: pd.DataFrame) -> list:
     """Per-algo/type detail tables with aggregate MTM% + below-average flag.
 
@@ -1466,6 +1754,7 @@ _PAGE_DEFAULTS = dict(
     summary_html=None, alloc_report_html=None,
     error=None, notice=None, blocks=[], token=None, range_label="",
     date_from="", date_to="", data_token="", data_name="",
+    pos_token="", pos_name="",
     users_html="", brokers_html="", servers_html="", algos_html="",
     filter_summary="No filters applied", qs_filter=False,
 )
@@ -1489,10 +1778,27 @@ def index():
 
 @app.route("/process", methods=["POST"])
 def process():
+    # Optional positional-algos workbook (kept across actions via pos_token).
+    # Deliberately not cleared by _reset_upload_state: a new data CSV keeps it.
+    pos_token = request.form.get("pos_token") or ""
+    pos_file = request.files.get("pos_file")
+    if pos_file and pos_file.filename:
+        try:
+            pos_map = load_positional_file(pos_file.read())
+        except Exception as e:  # unreadable / wrong-format workbook
+            return _page(error=f"Could not read positional file: {e}")
+        pos_token = uuid.uuid4().hex
+        _POS_CACHE[pos_token] = (pos_file.filename, pos_map)
+        for k in list(_POS_CACHE)[:-3]:
+            _POS_CACHE.pop(k, None)
+    pos_name, pos_map = _POS_CACHE.get(pos_token, ("", None))
+    if pos_map is None:
+        pos_token = ""
+
     # Get the CSV bytes
     f = request.files.get("file")
     data_token = request.form.get("data_token") or ""
-    
+
     if f and f.filename:
         raw = f.read()
         data_name = f.filename
@@ -1505,14 +1811,16 @@ def process():
     elif data_token and data_token in _DATA_CACHE:
         data_name, raw = _DATA_CACHE[data_token]
     else:
-        return _page(error="Please choose a CSV file.")
+        return _page(error="Please choose a CSV file.",
+                     pos_token=pos_token, pos_name=pos_name)
+
+    opts_ctx = dict(data_token=data_token, data_name=data_name,
+                    pos_token=pos_token, pos_name=pos_name)
 
     try:
         df = load_csv(raw)
     except (pd.errors.EmptyDataError, UnicodeDecodeError, ValueError, OSError) as e:
-        return _page(error=f"Could not read CSV: {e}")
-
-    opts_ctx = dict(data_token=data_token, data_name=data_name)
+        return _page(error=f"Could not read CSV: {e}", **opts_ctx)
 
     # Get filter values for display
     selected_users = request.form.getlist('user_ids')
@@ -1593,10 +1901,19 @@ def process():
         # No filters applied, use full dataframe
         filter_summary = "No filters applied"
 
+    # Whole cycles are re-denominated at their 0DTE allocation BEFORE the date
+    # range cut, so a range that starts on the 1DTE leg still sees the 0DTE row.
+    df, alloc_stats = apply_final_allocation(df, pos_map)
+    calc_notice = (f"✓ 0DTE allocation applied to {alloc_stats['rows_changed']:,} leg rows "
+                   f"across {alloc_stats['cycles']:,} positional cycles"
+                   + (f" ({alloc_stats['no_zero_dte']:,} never reached 0DTE — last leg's "
+                      f"allocation used)" if alloc_stats["no_zero_dte"] else "")
+                   + ".") if pos_map else None
+
     min_d, max_d = df["date"].min().date(), df["date"].max().date()
     df_from = request.form.get("date_from") or str(min_d)
     df_to = request.form.get("date_to") or str(max_d)
-    
+
     try:
         d_from = pd.to_datetime(df_from).date()
         d_to = pd.to_datetime(df_to).date()
@@ -1626,7 +1943,7 @@ def process():
             **opts_ctx
         )
 
-    rollup = build_account_rollup(df_range)
+    rollup = build_account_rollup(df_range, pos_map)
 
     # Build three scoped reports: Overall, 1.25CR & above, Below 1.25CR.
     reports = []
@@ -1634,11 +1951,12 @@ def process():
         raw_scope = _scope_raw(df_range, rl)
         token = uuid.uuid4().hex
         _EXCEL_CACHE[token] = (
-            f"int_pos_{key}_{d_from}_{d_to}.xlsx", build_excel(rl, raw_scope))
+            f"int_pos_{key}_{d_from}_{d_to}.xlsx", build_excel(rl, raw_scope, pos_map))
         reports.append({
             "key": key, "label": label, "icon": icon, "count": len(rl),
             "token": token,
             "summary_html": _render_summary(rl) if not rl.empty else "",
+            "month_html": _month_summary_html(build_month_summary(raw_scope, pos_map)),
             "alloc_report_html": _alloc_report_html(compute_alloc_report(rl)),
             "blocks": build_detail_blocks(rl),
         })
@@ -1648,7 +1966,7 @@ def process():
             _EXCEL_CACHE.pop(k, None)
 
     return _page(
-        reports=reports,
+        reports=reports, notice=calc_notice,
         range_label=f"{d_from} to {d_to}",
         date_from=df_from, date_to=df_to,
         users_html=users_html, brokers_html=brokers_html,
